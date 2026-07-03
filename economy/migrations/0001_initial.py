@@ -130,7 +130,7 @@ class Migration(migrations.Migration):
                     ),
                 ),
                 ("pending", models.PositiveBigIntegerField(default=0, help_text="Currency accumulated but not yet claimed.")),
-                ("last_tick", models.DateTimeField(auto_now=True, help_text="Last time the passive task updated this pool.")),
+                ("last_tick", models.DateTimeField(blank=True, null=True, help_text="Last time the passive task updated this pool.")),
                 ("total_earned", models.PositiveBigIntegerField(default=0, help_text="Total passive income ever earned.")),
             ],
             options={
