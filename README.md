@@ -2,7 +2,7 @@
 
 ```toml
 [[ballsdex.packages]]
-location = "git+https://github.com/yourname/economy_repo.git@v1.0.0"
+location = "git+https://github.com/xoyzo/economy_repo.git@v1.0.0"
 path = "economy"
 enabled = true
 ```
