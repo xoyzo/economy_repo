@@ -224,6 +224,7 @@ class Economy(commands.Cog):
                 )
                 pool.pending += total
                 pool.total_earned += total
+                pool.last_tick = timezone.now()
                 await pool.asave(update_fields=["pending", "total_earned", "last_tick"])
 
     @passive_income_task.before_loop
