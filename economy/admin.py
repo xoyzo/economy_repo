@@ -1,15 +1,19 @@
 from django.contrib import admin
 
-from .models import BallListing, EconomyConfig, PassiveIncomePool
+from .models import BallListing, BallSellPrice, EconomySettings, PassiveIncomePool
 
 
-@admin.register(EconomyConfig)
-class EconomyConfigAdmin(admin.ModelAdmin):
+@admin.register(EconomySettings)
+class EconomySettingsAdmin(admin.ModelAdmin):
     fieldsets = (
         (
             "Layer 1 — Catch Income",
             {
-                "description": "Money earned automatically on every catch via monkeypatch.",
+                "description": (
+                    "Currency earned automatically on every catch via monkeypatch. "
+                    "Formula: random(catch_base_min, catch_base_max) + rarity * catch_rarity_multiplier. "
+                    "Ball rarity is 0.0–1.0, so catch_rarity_multiplier of 50 adds 0–50 extra."
+                ),
                 "fields": (
                     "catch_income_enabled",
                     "catch_base_min",
@@ -20,18 +24,35 @@ class EconomyConfigAdmin(admin.ModelAdmin):
             },
         ),
         (
-            "Layer 2 — Ball Selling",
+            "Layer 2 — Quick Sell",
             {
-                "description": "Quick sell rates and player listing settings.",
+                "description": (
+                    "Per-ball prices are set in Ball Sell Prices below. "
+                    "These defaults apply to any ball without a specific price record. "
+                    "Price = random(default_min, default_max), multiplied if special, bonus if high roll."
+                ),
                 "fields": (
-                    "sell_enabled",
-                    "sell_base_min",
-                    "sell_base_max",
-                    "sell_rarity_multiplier",
-                    "sell_special_multiplier",
-                    "sell_stat_multiplier",
+                    "quicksell_enabled",
+                    "quicksell_default_min",
+                    "quicksell_default_max",
+                    "quicksell_special_multiplier",
+                    "quicksell_high_roll_bonus",
+                ),
+            },
+        ),
+        (
+            "Layer 2 — Player Market",
+            {
+                "description": (
+                    "Player-to-player ball listings. "
+                    "The platform fee is deducted from the seller's payout and acts as a currency sink."
+                ),
+                "fields": (
+                    "listings_enabled",
                     "listing_platform_fee",
+                    "listing_min_price",
                     "listing_expiry_hours",
+                    "listing_max_per_player",
                 ),
             },
         ),
@@ -40,8 +61,9 @@ class EconomyConfigAdmin(admin.ModelAdmin):
             {
                 "description": (
                     "Background task runs every passive_interval_minutes minutes. "
-                    "Each ball the player owns has a passive_chance to generate "
-                    "passive_min to passive_max currency, scaled by rarity."
+                    "Each ball a player owns rolls passive_chance. On success: "
+                    "random(passive_min, passive_max) + rarity * passive_rarity_bonus. "
+                    "Currency accumulates in a pool until the player runs /economy claim."
                 ),
                 "fields": (
                     "passive_enabled",
@@ -49,24 +71,43 @@ class EconomyConfigAdmin(admin.ModelAdmin):
                     "passive_interval_minutes",
                     "passive_min",
                     "passive_max",
-                    "passive_rarity_multiplier",
+                    "passive_rarity_bonus",
+                ),
+            },
+        ),
+        (
+            "Per-Command Toggles",
+            {
+                "description": "Individually enable or disable specific player-facing commands.",
+                "fields": (
+                    "balance_enabled",
+                    "pending_enabled",
+                    "claim_enabled",
                 ),
             },
         ),
     )
 
 
-@admin.register(PassiveIncomePool)
-class PassiveIncomePoolAdmin(admin.ModelAdmin):
-    list_display = ("player", "pending", "last_tick")
-    search_fields = ("player__discord_id",)
-    readonly_fields = ("player", "pending", "last_tick")
+@admin.register(BallSellPrice)
+class BallSellPriceAdmin(admin.ModelAdmin):
+    list_display = ("ball", "min_price", "max_price")
+    search_fields = ("ball__country",)
+    autocomplete_fields = ("ball",)
 
 
 @admin.register(BallListing)
 class BallListingAdmin(admin.ModelAdmin):
-    list_display = ("ball_instance", "seller", "price", "sold", "buyer", "created_at", "expires_at")
+    list_display = ("pk", "ball_instance", "seller", "price", "sold", "buyer", "created_at", "expires_at")
     list_filter = ("sold",)
     search_fields = ("seller__discord_id", "buyer__discord_id")
-    readonly_fields = ("seller", "ball_instance", "buyer", "sold_at", "created_at")
-    autocomplete_fields = ()
+    readonly_fields = ("seller", "ball_instance", "buyer", "sold_at", "created_at", "expires_at")
+    ordering = ("-created_at",)
+
+
+@admin.register(PassiveIncomePool)
+class PassiveIncomePoolAdmin(admin.ModelAdmin):
+    list_display = ("player", "pending", "total_earned", "last_tick")
+    search_fields = ("player__discord_id",)
+    readonly_fields = ("player", "total_earned", "last_tick")
+    ordering = ("-pending",)
