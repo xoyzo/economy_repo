@@ -12,9 +12,9 @@ enabled = true
 Three-layer currency earning system for BallsDex. All commands and features can be individually
 enabled or disabled from the admin panel.
 
-> ⚠️ **Currency must be enabled in bot settings first.**
-> Admin panel → Settings → set a Currency Name. All commands return a disabled
-> message until this is configured.
+⚠️ Currency must be enabled in bot settings first.
+Admin panel → Settings → set a Currency Name. All commands return a disabled
+message until this is configured.
 
 ## How it works
 
