@@ -326,7 +326,8 @@ class PassiveIncomePool(models.Model):
         help_text="Currency accumulated but not yet claimed.",
     )
     last_tick = models.DateTimeField(
-        auto_now=True,
+        null=True,
+        blank=True,
         help_text="Last time the passive task updated this pool.",
     )
     total_earned = models.PositiveBigIntegerField(
