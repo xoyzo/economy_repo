@@ -120,7 +120,22 @@ class Economy(commands.Cog):
         self.bot = bot
 
     async def cog_load(self) -> None:
-        # Refresh cache
+        # Check table exists before any DB query — guards against loading before migrations run
+        from django.db import connection
+        from asgiref.sync import sync_to_async
+        get_table_names = sync_to_async(connection.introspection.table_names)
+        table_names = await get_table_names()
+        if "economy_settings" not in table_names:
+            log.error(
+                "Economy: economy_settings table missing. "
+                "Run: docker compose run --rm migration python3 -m django migrate economy zero --fake "
+                "then: docker compose run --rm migration python3 -m django migrate economy"
+            )
+            BallSpawnView.catch_ball = _patched_catch_ball  # type: ignore[method-assign]
+            self.passive_income_task.start()
+            self.expire_listings_task.start()
+            return
+
         invalidate_settings_cache()
         cfg = await get_economy_settings()
 
@@ -131,11 +146,9 @@ class Economy(commands.Cog):
             )
 
         if cfg is None:
-            log.error(
-                "Economy: EconomySettings record not found. "
-                "Run migrations and check the admin panel."
-            )
-            return
+            log.warning("Economy: no EconomySettings record found — creating with defaults.")
+            from ..models import EconomySettings as ES
+            cfg = await ES.objects.acreate()
 
         # Patch BallSpawnView at the class level — works for all spawn paths
         BallSpawnView.catch_ball = _patched_catch_ball  # type: ignore[method-assign]
