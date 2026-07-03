@@ -3,18 +3,20 @@ from __future__ import annotations
 import logging
 import random
 from datetime import timedelta
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
+from django.utils import timezone
 
 from ballsdex.core.utils.transformers import BallInstanceTransformer
 from ballsdex.packages.countryballs.countryball import BallSpawnView
 from bd_models.models import BallInstance, Player
 from settings.models import settings
+from settings.utils import format_currency
 
-from ..models import BallListing, EconomyConfig, PassiveIncomePool
+from ..models import BallListing, BallSellPrice, EconomySettings, PassiveIncomePool
 
 if TYPE_CHECKING:
     from ballsdex.core.bot import BallsDexBot
@@ -23,125 +25,189 @@ log = logging.getLogger(__name__)
 
 BallInstanceTransform = app_commands.Transform[BallInstance, BallInstanceTransformer]
 
-
-def fmt_currency(amount: int) -> str:
-    """Format an amount using the bot's configured currency symbol and name."""
-    sym = settings.currency_symbol or ""
-    if sym:
-        if settings.currency_symbol_before:
-            return f"{sym}{amount:,}"
-        return f"{amount:,}{sym}"
-    return f"{amount:,} {settings.currency_plural}"
+# Cache the settings in memory — refreshed on cog load and when admin saves
+_settings_cache: EconomySettings | None = None
 
 
-async def get_config() -> EconomyConfig | None:
-    return await EconomyConfig.objects.afirst()
+async def get_economy_settings() -> EconomySettings | None:
+    global _settings_cache
+    if _settings_cache is None:
+        _settings_cache = await EconomySettings.objects.afirst()
+    return _settings_cache
 
 
-def compute_sell_price(config: EconomyConfig, ball_instance: BallInstance) -> int:
-    base = random.randint(config.sell_base_min, config.sell_base_max)
-    price = base + ball_instance.ball.rarity * config.sell_rarity_multiplier
-    if ball_instance.special_id is not None:
-        price *= config.sell_special_multiplier
-    price += (ball_instance.attack_bonus + ball_instance.health_bonus) * config.sell_stat_multiplier
-    return max(1, int(price))
+def invalidate_settings_cache() -> None:
+    global _settings_cache
+    _settings_cache = None
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def currency_enabled() -> bool:
+    return bool(settings.currency_name)
+
+
+def fmt(amount: int) -> str:
+    """Format an amount using the bot's currency settings."""
+    return format_currency(amount)
+
+
+def disabled_embed(reason: str) -> discord.Embed:
+    return discord.Embed(
+        title="Command Disabled",
+        description=reason,
+        color=discord.Color.red(),
+    )
+
+
+def error_embed(title: str, description: str) -> discord.Embed:
+    return discord.Embed(title=title, description=description, color=discord.Color.red())
+
+
+# ── Monkeypatch ───────────────────────────────────────────────────────────────
+
+_original_catch_ball = BallSpawnView.catch_ball
+
+
+async def _patched_catch_ball(
+    self: BallSpawnView,
+    user: discord.User | discord.Member,
+    *,
+    player: Player | None,
+    guild: discord.Guild | None,
+):
+    """
+    Replacement for BallSpawnView.catch_ball that adds catch income.
+    Patches at the class level so it works regardless of how the cog spawns balls.
+    """
+    ball, is_new = await _original_catch_ball(self, user, player=player, guild=guild)
+
+    if not currency_enabled():
+        return ball, is_new
+
+    cfg = await get_economy_settings()
+    if cfg is None or not cfg.catch_income_enabled:
+        return ball, is_new
+
+    # player is set by the original catch_ball — re-fetch from ball if needed
+    if player is None:
+        try:
+            player = await Player.objects.aget(discord_id=user.id)
+        except Player.DoesNotExist:
+            return ball, is_new
+
+    earned = cfg.compute_catch_income(
+        rarity=ball.ball.rarity,
+        has_special=ball.special_id is not None,
+    )
+
+    await player.add_money(earned)
+    log.debug(
+        "Catch income: player %s earned %s for catching %s",
+        user.id, earned, ball.ball.country,
+    )
+
+    return ball, is_new
 
 
 class Economy(commands.Cog):
     """
-    Economy system — catch income, ball selling and passive income.
-    All commands are disabled if currency is not configured in bot settings.
+    Economy package — catch income, quick sell, player market, passive income.
+    Currency must be configured in bot settings for any commands to work.
     """
 
     def __init__(self, bot: "BallsDexBot") -> None:
         self.bot = bot
-        self._config: EconomyConfig | None = None
 
     async def cog_load(self) -> None:
-        self._config = await get_config()
-        if not settings.currency_enabled:
+        # Refresh cache
+        invalidate_settings_cache()
+        cfg = await get_economy_settings()
+
+        if not currency_enabled():
             log.warning(
                 "Economy: currency_name is not set in bot settings. "
-                "All economy commands will show a disabled message until it is configured."
+                "All economy commands will be disabled until it is configured."
             )
-        await self._monkeypatch()
-        self.passive_income_task.change_interval(
-            minutes=self._config.passive_interval_minutes if self._config else 10
-        )
+
+        if cfg is None:
+            log.error(
+                "Economy: EconomySettings record not found. "
+                "Run migrations and check the admin panel."
+            )
+            return
+
+        # Patch BallSpawnView at the class level — works for all spawn paths
+        BallSpawnView.catch_ball = _patched_catch_ball  # type: ignore[method-assign]
+        log.info("Economy: BallSpawnView.catch_ball monkeypatched for catch income.")
+
+        # Start background tasks with correct interval
+        self.passive_income_task.change_interval(minutes=cfg.passive_interval_minutes)
         self.passive_income_task.start()
         self.expire_listings_task.start()
 
     def cog_unload(self) -> None:
+        # Restore original method
+        BallSpawnView.catch_ball = _original_catch_ball  # type: ignore[method-assign]
         self.passive_income_task.cancel()
         self.expire_listings_task.cancel()
+        log.info("Economy: BallSpawnView.catch_ball restored.")
 
-    # ── Currency guard ────────────────────────────────────────────────────────
+    # ── Guards ────────────────────────────────────────────────────────────────
 
-    async def _check_currency(self, interaction: discord.Interaction) -> bool:
-        if not settings.currency_enabled:
+    async def _guard_currency(self, interaction: discord.Interaction) -> bool:
+        if not currency_enabled():
             await interaction.response.send_message(
-                f"Currency is not enabled on this bot. "
-                f"An administrator must set a currency name in the bot settings first.",
+                embed=disabled_embed(
+                    "Currency is not enabled on this bot.\n"
+                    "An administrator must set a **Currency Name** in bot settings first."
+                ),
                 ephemeral=True,
             )
             return False
         return True
 
-    # ── Monkeypatch — Layer 1: Catch income ───────────────────────────────────
+    async def _guard_command(
+        self,
+        interaction: discord.Interaction,
+        enabled: bool,
+        command_name: str,
+    ) -> bool:
+        if not enabled:
+            await interaction.response.send_message(
+                embed=disabled_embed(f"The `{command_name}` command is currently disabled."),
+                ephemeral=True,
+            )
+            return False
+        return True
 
-    async def _monkeypatch(self) -> None:
-        from ballsdex.packages.countryballs import CountryBallsSpawner
-        cog = cast("CountryBallsSpawner", self.bot.get_cog("CountryBallsSpawner"))
-        if cog is None:
-            log.warning("Economy: CountryBallsSpawner not found, catch income will not work.")
-            return
-
-        economy_cog = self
-
-        class BallSpawnViewOverride(BallSpawnView):
-            async def catch_ball(
-                self,
-                user: discord.User | discord.Member,
-                *,
-                player: Player | None,
-                guild: discord.Guild | None,
-            ):
-                ball, is_new = await super().catch_ball(user, player=player, guild=guild)
-
-                if not settings.currency_enabled:
-                    return ball, is_new
-
-                config = economy_cog._config
-                if config is None or not config.catch_income_enabled:
-                    return ball, is_new
-                if player is None:
-                    return ball, is_new
-
-                earned = random.randint(config.catch_base_min, config.catch_base_max)
-                earned += int(ball.ball.rarity * config.catch_rarity_multiplier)
-                if ball.special_id is not None:
-                    earned += config.catch_special_bonus
-
-                await Player.objects.filter(pk=player.pk).aupdate(
-                    money=player.money + earned
-                )
-                log.debug(
-                    "Catch income: player %s earned %d (%s)",
-                    player.discord_id, earned, ball.ball.country,
-                )
-                return ball, is_new
-
-        cog.countryball_cls = BallSpawnViewOverride
-        log.info("Economy: catch income monkeypatch applied.")
+    async def _get_player(self, interaction: discord.Interaction) -> Player | None:
+        try:
+            return await Player.objects.aget(discord_id=interaction.user.id)
+        except Player.DoesNotExist:
+            send = (
+                interaction.followup.send
+                if interaction.response.is_done()
+                else interaction.response.send_message
+            )
+            await send(
+                embed=error_embed(
+                    "No Account",
+                    f"You don't have a player profile yet. "
+                    f"Catch some {settings.plural_collectible_name} first!",
+                ),
+                ephemeral=True,
+            )
+            return None
 
     # ── Background tasks ──────────────────────────────────────────────────────
 
     @tasks.loop(minutes=10)
     async def passive_income_task(self) -> None:
-        if not settings.currency_enabled:
+        if not currency_enabled():
             return
-        config = await get_config()
-        if config is None or not config.passive_enabled:
+        cfg = await get_economy_settings()
+        if cfg is None or not cfg.passive_enabled:
             return
 
         async for player in Player.objects.all():
@@ -149,34 +215,34 @@ class Economy(commands.Cog):
             async for bi in BallInstance.objects.filter(
                 player=player, deleted=False
             ).select_related("ball"):
-                if random.random() < config.passive_chance:
-                    amount = random.randint(config.passive_min, config.passive_max)
-                    multiplier = 1.0 + bi.ball.rarity * config.passive_rarity_multiplier
-                    total += int(amount * multiplier)
+                if random.random() < cfg.passive_chance:
+                    total += cfg.compute_passive_tick(bi.ball.rarity)
 
             if total > 0:
                 pool, _ = await PassiveIncomePool.objects.aget_or_create(
-                    player=player, defaults={"pending": 0}
+                    player=player, defaults={"pending": 0, "total_earned": 0}
                 )
                 pool.pending += total
-                await pool.asave(update_fields=["pending", "last_tick"])
+                pool.total_earned += total
+                await pool.asave(update_fields=["pending", "total_earned", "last_tick"])
 
     @passive_income_task.before_loop
     async def before_passive(self) -> None:
         await self.bot.wait_until_ready()
 
-    @tasks.loop(minutes=30)
+    @tasks.loop(minutes=15)
     async def expire_listings_task(self) -> None:
-        from django.utils import timezone
         now = timezone.now()
-        async for listing in BallListing.objects.filter(
+        expired = await BallListing.objects.filter(
             sold=False, expires_at__lte=now
-        ).select_related("ball_instance", "seller"):
-            listing.ball_instance.player = listing.seller
-            await listing.ball_instance.asave(update_fields=["player"])
+        ).select_related("ball_instance", "seller").alist()
+
+        for listing in expired:
+            # Ball stays with the seller since they still own it — just delete the listing
             await listing.adelete()
             log.info(
-                "Listing expired: ball %s returned to player %s",
+                "Economy: listing #%d expired, ball %d returned to player %d",
+                listing.pk,
                 listing.ball_instance_id,
                 listing.seller.discord_id,
             )
@@ -189,57 +255,50 @@ class Economy(commands.Cog):
 
     economy_group = app_commands.Group(
         name="economy",
-        description="Earn, sell and manage your currency.",
+        description="Currency commands — earn, sell and manage your balance.",
     )
 
-    # ── Balance ───────────────────────────────────────────────────────────────
+    # ── /economy balance ──────────────────────────────────────────────────────
 
     @economy_group.command(name="balance")
     async def balance(self, interaction: discord.Interaction["BallsDexBot"]) -> None:
-        """
-        Check your current balance and pending passive income.
-        """
-        if not await self._check_currency(interaction):
+        """Check your current currency balance and pending passive income."""
+        if not await self._guard_currency(interaction):
             return
 
-        try:
-            player = await Player.objects.aget(discord_id=interaction.user.id)
-        except Player.DoesNotExist:
-            await interaction.response.send_message(
-                f"You don't have a player profile yet. "
-                f"Catch some {settings.plural_collectible_name} first!",
-                ephemeral=True,
-            )
+        cfg = await get_economy_settings()
+        if cfg and not await self._guard_command(interaction, cfg.balance_enabled, "/economy balance"):
+            return
+
+        player = await self._get_player(interaction)
+        if player is None:
             return
 
         try:
             pool = await PassiveIncomePool.objects.aget(player=player)
             pending = pool.pending
+            total_earned = pool.total_earned
         except PassiveIncomePool.DoesNotExist:
             pending = 0
+            total_earned = 0
+
+        active_listings = await BallListing.objects.filter(seller=player, sold=False).acount()
 
         embed = discord.Embed(
-            title=f"{interaction.user.display_name}'s {settings.currency_name} Balance",
+            title=f"{interaction.user.display_name}'s Balance",
             color=discord.Color.gold(),
         )
         embed.set_thumbnail(url=interaction.user.display_avatar.url)
-        embed.add_field(
-            name="💰 Balance",
-            value=fmt_currency(player.money),
-            inline=True,
-        )
-        embed.add_field(
-            name="⏳ Pending",
-            value=fmt_currency(pending),
-            inline=True,
-        )
-        embed.set_footer(
-            text=f"Use /economy claim to collect your pending {settings.currency_plural}."
-        )
+        embed.add_field(name="💰 Balance", value=fmt(player.money), inline=True)
+        embed.add_field(name="⏳ Pending Income", value=fmt(pending), inline=True)
+        embed.add_field(name="📊 Active Listings", value=str(active_listings), inline=True)
+        if total_earned:
+            embed.add_field(name="📈 Total Passive Earned", value=fmt(total_earned), inline=True)
+        embed.set_footer(text=f"Use /economy claim to collect pending {settings.currency_plural}.")
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    # ── Layer 2: Quick sell ───────────────────────────────────────────────────
+    # ── /economy quicksell ────────────────────────────────────────────────────
 
     @economy_group.command(name="quicksell")
     @app_commands.describe(ball="The ball you want to sell to the system instantly.")
@@ -250,91 +309,111 @@ class Economy(commands.Cog):
     ) -> None:
         """
         Sell a ball instantly to the system for currency.
-        Price is based on rarity, special and stat rolls.
+        Price is set per-ball in the admin panel, with a default fallback.
         """
-        if not await self._check_currency(interaction):
+        if not await self._guard_currency(interaction):
             return
 
-        config = self._config or await get_config()
-        if config is None or not config.sell_enabled:
+        cfg = await get_economy_settings()
+        if cfg is None:
             await interaction.response.send_message(
-                "Selling is currently disabled.", ephemeral=True
-            )
-            return
-
-        try:
-            player = await Player.objects.aget(discord_id=interaction.user.id)
-        except Player.DoesNotExist:
-            await interaction.response.send_message(
-                f"You don't have a player profile yet. "
-                f"Catch some {settings.plural_collectible_name} first!",
+                embed=error_embed("Not Configured", "Economy settings not found. Contact an administrator."),
                 ephemeral=True,
             )
+            return
+        if not await self._guard_command(interaction, cfg.quicksell_enabled, "/economy quicksell"):
+            return
+
+        player = await self._get_player(interaction)
+        if player is None:
             return
 
         if ball.player_id != player.pk:
             await interaction.response.send_message(
-                f"You don't own that {settings.collectible_name}.", ephemeral=True
+                embed=error_embed("Not Your Ball", f"You don't own that {settings.collectible_name}."),
+                ephemeral=True,
             )
             return
 
         if ball.favorite:
             await interaction.response.send_message(
-                f"You can't sell a favourited {settings.collectible_name}. "
-                "Unfavourite it first.",
+                embed=error_embed(
+                    "Ball is Favourited",
+                    f"Unfavourite this {settings.collectible_name} before selling it.",
+                ),
                 ephemeral=True,
             )
             return
 
         if await BallListing.objects.filter(ball_instance=ball, sold=False).aexists():
             await interaction.response.send_message(
-                f"That {settings.collectible_name} is currently listed for sale. "
-                "Use `/economy delist` to remove it first.",
+                embed=error_embed(
+                    "Ball is Listed",
+                    f"That {settings.collectible_name} is currently on the market. "
+                    "Use `/economy delist` to remove it first.",
+                ),
                 ephemeral=True,
             )
             return
 
+        # Fetch per-ball price config if it exists
+        try:
+            price_config = await BallSellPrice.objects.aget(ball=ball.ball)
+            ball_min = price_config.min_price
+            ball_max = price_config.max_price
+        except BallSellPrice.DoesNotExist:
+            ball_min = None
+            ball_max = None
+
         await ball.arefresh_from_db()
-        price = compute_sell_price(config, ball)
+        price = cfg.compute_quicksell_price(
+            rarity=ball.ball.rarity,
+            has_special=ball.special_id is not None,
+            attack_bonus=ball.attack_bonus,
+            health_bonus=ball.health_bonus,
+            ball_min=ball_min,
+            ball_max=ball_max,
+        )
+
         special_name = ball.specialcard.name if ball.special_id and ball.specialcard else None
 
+        # Delete the ball — mark as deleted, same as core trade logic
         ball.deleted = True
         await ball.asave(update_fields=["deleted"])
-        new_balance = player.money + price
-        await Player.objects.filter(pk=player.pk).aupdate(money=new_balance)
+        await player.add_money(price)
 
         embed = discord.Embed(
             title=f"{settings.collectible_name.title()} Sold",
             color=discord.Color.green(),
         )
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
         embed.add_field(
             name=settings.collectible_name.title(),
-            value=f"**{ball.ball.country}**" + (f" — *{special_name}*" if special_name else ""),
+            value=f"**{ball.ball.country}**" + (f"\n*{special_name}*" if special_name else ""),
             inline=True,
         )
         embed.add_field(
-            name="You Received",
-            value=fmt_currency(price),
+            name="Stats",
+            value=f"ATK: {ball.attack_bonus:+}% | HP: {ball.health_bonus:+}%",
             inline=True,
         )
-        embed.add_field(
-            name="New Balance",
-            value=fmt_currency(new_balance),
-            inline=True,
-        )
+        embed.add_field(name="You Received", value=fmt(price), inline=True)
+        embed.add_field(name="New Balance", value=fmt(player.money + price), inline=False)
         embed.set_footer(
-            text=f"Quick sell prices are based on rarity, special and stat rolls. "
-                 f"Use /economy list to sell to other players instead."
+            text=(
+                "Quick sell prices are set per ball in the admin panel. "
+                "Use /economy list to sell to other players for potentially more."
+            )
         )
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    # ── Layer 2: Player listing ───────────────────────────────────────────────
+    # ── /economy list ─────────────────────────────────────────────────────────
 
     @economy_group.command(name="list")
     @app_commands.describe(
-        ball="The ball you want to list for other players to buy.",
-        price="The price you want to sell it for.",
+        ball="The ball you want to list on the market.",
+        price="The price in currency you want to sell it for.",
     )
     async def list_ball(
         self,
@@ -343,101 +422,142 @@ class Economy(commands.Cog):
         price: int,
     ) -> None:
         """
-        List a ball for sale at a price you set.
+        List a ball on the player market at a price you set.
         Other players can browse with /economy listings and buy with /economy buy.
         """
-        if not await self._check_currency(interaction):
+        if not await self._guard_currency(interaction):
             return
 
-        if price < 1:
+        cfg = await get_economy_settings()
+        if cfg is None:
             await interaction.response.send_message(
-                "Price must be at least 1.", ephemeral=True
+                embed=error_embed("Not Configured", "Economy settings not found."), ephemeral=True
             )
             return
-
-        config = self._config or await get_config()
-        if config is None or not config.sell_enabled:
-            await interaction.response.send_message(
-                "Selling is currently disabled.", ephemeral=True
-            )
+        if not await self._guard_command(interaction, cfg.listings_enabled, "/economy list"):
             return
 
-        try:
-            player = await Player.objects.aget(discord_id=interaction.user.id)
-        except Player.DoesNotExist:
+        if price < cfg.listing_min_price:
             await interaction.response.send_message(
-                f"You don't have a player profile yet. "
-                f"Catch some {settings.plural_collectible_name} first!",
+                embed=error_embed(
+                    "Price Too Low",
+                    f"Minimum listing price is {fmt(cfg.listing_min_price)}.",
+                ),
                 ephemeral=True,
             )
             return
 
+        player = await self._get_player(interaction)
+        if player is None:
+            return
+
         if ball.player_id != player.pk:
             await interaction.response.send_message(
-                f"You don't own that {settings.collectible_name}.", ephemeral=True
+                embed=error_embed("Not Your Ball", f"You don't own that {settings.collectible_name}."),
+                ephemeral=True,
             )
             return
 
         if ball.favorite:
             await interaction.response.send_message(
-                f"You can't list a favourited {settings.collectible_name}. "
-                "Unfavourite it first.",
+                embed=error_embed(
+                    "Ball is Favourited",
+                    f"Unfavourite this {settings.collectible_name} before listing it.",
+                ),
                 ephemeral=True,
             )
             return
 
         if await BallListing.objects.filter(ball_instance=ball, sold=False).aexists():
             await interaction.response.send_message(
-                f"That {settings.collectible_name} is already listed for sale.",
+                embed=error_embed("Already Listed", f"That {settings.collectible_name} is already on the market."),
                 ephemeral=True,
             )
             return
 
-        from django.utils import timezone
-        expires_at = timezone.now() + timedelta(hours=config.listing_expiry_hours)
+        active_count = await BallListing.objects.filter(seller=player, sold=False).acount()
+        if active_count >= cfg.listing_max_per_player:
+            await interaction.response.send_message(
+                embed=error_embed(
+                    "Listing Limit Reached",
+                    f"You can only have **{cfg.listing_max_per_player}** active listings at once. "
+                    "Use `/economy delist` to remove one first.",
+                ),
+                ephemeral=True,
+            )
+            return
 
-        await BallListing.objects.acreate(
+        expires_at = timezone.now() + timedelta(hours=cfg.listing_expiry_hours)
+        listing = await BallListing.objects.acreate(
             seller=player,
             ball_instance=ball,
             price=price,
             expires_at=expires_at,
         )
 
+        special_name = ball.specialcard.name if ball.special_id and ball.specialcard else None
+        fee_amount = int(price * cfg.listing_platform_fee)
+
         embed = discord.Embed(
             title=f"{settings.collectible_name.title()} Listed",
             color=discord.Color.blurple(),
         )
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
         embed.add_field(
             name=settings.collectible_name.title(),
-            value=f"**{ball.ball.country}**",
+            value=f"**{ball.ball.country}**" + (f"\n*{special_name}*" if special_name else ""),
             inline=True,
         )
         embed.add_field(
-            name="Listed Price",
-            value=fmt_currency(price),
+            name="Stats",
+            value=f"ATK: {ball.attack_bonus:+}% | HP: {ball.health_bonus:+}%",
             inline=True,
         )
-        embed.add_field(
-            name="Expires",
-            value=f"<t:{int(expires_at.timestamp())}:R>",
-            inline=True,
-        )
-        embed.set_footer(
-            text=f"A {config.listing_platform_fee * 100:.0f}% platform fee is deducted on sale. "
-                 f"Use /economy delist #{ball.pk:X} to cancel."
-        )
+        embed.add_field(name="Listed Price", value=fmt(price), inline=True)
+        embed.add_field(name="You'll Receive", value=fmt(price - fee_amount), inline=True)
+        embed.add_field(name="Platform Fee", value=f"{cfg.listing_platform_fee * 100:.0f}% ({fmt(fee_amount)})", inline=True)
+        embed.add_field(name="Expires", value=f"<t:{int(expires_at.timestamp())}:R>", inline=True)
+        embed.add_field(name="Listing ID", value=f"`#{listing.pk}`", inline=True)
+        embed.set_footer(text="Use /economy delist to remove this listing at any time.")
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
+    # ── /economy listings ─────────────────────────────────────────────────────
+
     @economy_group.command(name="listings")
-    async def listings(self, interaction: discord.Interaction["BallsDexBot"]) -> None:
-        """
-        Browse all active ball listings from other players.
-        """
-        if not await self._check_currency(interaction):
+    @app_commands.describe(page="Page number to view (25 listings per page).")
+    async def listings(
+        self,
+        interaction: discord.Interaction["BallsDexBot"],
+        page: int = 1,
+    ) -> None:
+        """Browse all active ball listings on the player market."""
+        if not await self._guard_currency(interaction):
+            return
+
+        cfg = await get_economy_settings()
+        if cfg and not await self._guard_command(interaction, cfg.listings_enabled, "/economy listings"):
             return
 
         await interaction.response.defer(ephemeral=True)
+
+        per_page = 10
+        offset = (max(1, page) - 1) * per_page
+
+        total = await BallListing.objects.filter(sold=False).acount()
+        if total == 0:
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title=f"{settings.plural_collectible_name.title()} Market",
+                    description=(
+                        "No active listings right now.\n"
+                        f"Use `/economy list` to sell your {settings.plural_collectible_name}!"
+                    ),
+                    color=discord.Color.blurple(),
+                ),
+                ephemeral=True,
+            )
+            return
 
         active = await BallListing.objects.filter(
             sold=False
@@ -445,45 +565,44 @@ class Economy(commands.Cog):
             "ball_instance__ball",
             "ball_instance__special",
             "seller",
-        ).order_by("price").alist()
+        ).order_by("price")[offset:offset + per_page].alist()
 
-        if not active:
-            await interaction.followup.send(
-                f"There are no active listings right now.\n"
-                f"Use `/economy list` to sell your {settings.plural_collectible_name}!",
-                ephemeral=True,
-            )
-            return
+        total_pages = max(1, (total + per_page - 1) // per_page)
+        page = max(1, min(page, total_pages))
 
         embed = discord.Embed(
             title=f"{settings.plural_collectible_name.title()} Market",
             description=(
-                f"**{len(active)}** active listing{'s' if len(active) != 1 else ''}  •  "
-                f"Sorted by price  •  Use `/economy buy <id>` to purchase"
+                f"**{total}** active listing{'s' if total != 1 else ''}  •  "
+                f"Page **{page}/{total_pages}**  •  Sorted by price\n"
+                f"Use `/economy buy <id>` to purchase  •  `/economy listings <page>` to browse"
             ),
             color=discord.Color.blurple(),
         )
 
-        for listing in active[:20]:
+        for listing in active:
             bi = listing.ball_instance
-            special_tag = f" *{bi.specialcard.name}*" if bi.special_id and bi.specialcard else ""
-            atk = f"{bi.attack_bonus:+}%" if bi.attack_bonus else "—"
-            hp = f"{bi.health_bonus:+}%" if bi.health_bonus else "—"
+            special_tag = f" *[{bi.specialcard.name}]*" if bi.special_id and bi.specialcard else ""
+            atk = f"{bi.attack_bonus:+}%" if bi.attack_bonus != 0 else "±0%"
+            hp = f"{bi.health_bonus:+}%" if bi.health_bonus != 0 else "±0%"
             embed.add_field(
                 name=f"`#{listing.pk}` {bi.ball.country}{special_tag}",
                 value=(
-                    f"💰 **{fmt_currency(listing.price)}**\n"
-                    f"ATK: {atk} | HP: {hp}\n"
-                    f"Seller: <@{listing.seller.discord_id}>\n"
-                    f"Expires: <t:{int(listing.expires_at.timestamp())}:R>"
+                    f"💰 **{fmt(listing.price)}**\n"
+                    f"ATK {atk} | HP {hp}\n"
+                    f"<@{listing.seller.discord_id}>\n"
+                    f"Expires <t:{int(listing.expires_at.timestamp())}:R>"
                 ),
                 inline=True,
             )
 
-        if len(active) > 20:
-            embed.set_footer(text=f"Showing 20 of {len(active)} listings.")
+        embed.set_footer(
+            text=f"Showing {offset + 1}–{min(offset + per_page, total)} of {total} listings."
+        )
 
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+    # ── /economy buy ──────────────────────────────────────────────────────────
 
     @economy_group.command(name="buy")
     @app_commands.describe(listing_id="The listing ID from /economy listings.")
@@ -492,20 +611,15 @@ class Economy(commands.Cog):
         interaction: discord.Interaction["BallsDexBot"],
         listing_id: int,
     ) -> None:
-        """
-        Buy a ball from another player's listing.
-        """
-        if not await self._check_currency(interaction):
+        """Purchase a ball from another player's listing."""
+        if not await self._guard_currency(interaction):
+            return
+
+        cfg = await get_economy_settings()
+        if cfg and not await self._guard_command(interaction, cfg.listings_enabled, "/economy buy"):
             return
 
         await interaction.response.defer(ephemeral=True)
-
-        config = self._config or await get_config()
-        if config is None:
-            await interaction.followup.send(
-                "Economy is not configured. Contact an administrator.", ephemeral=True
-            )
-            return
 
         try:
             listing = await BallListing.objects.select_related(
@@ -515,82 +629,93 @@ class Economy(commands.Cog):
             ).aget(pk=listing_id, sold=False)
         except BallListing.DoesNotExist:
             await interaction.followup.send(
-                "That listing doesn't exist or has already been sold.", ephemeral=True
+                embed=error_embed(
+                    "Listing Not Found",
+                    "That listing doesn't exist or has already been sold.",
+                ),
+                ephemeral=True,
             )
             return
 
-        try:
-            buyer = await Player.objects.aget(discord_id=interaction.user.id)
-        except Player.DoesNotExist:
-            await interaction.followup.send(
-                f"You don't have a player profile yet. "
-                f"Catch some {settings.plural_collectible_name} first!",
-                ephemeral=True,
-            )
+        buyer = await self._get_player(interaction)
+        if buyer is None:
             return
 
         if listing.seller_id == buyer.pk:
             await interaction.followup.send(
-                "You can't buy your own listing. Use `/economy delist` to remove it.",
+                embed=error_embed(
+                    "Can't Buy Your Own",
+                    "You can't buy your own listing. Use `/economy delist` to remove it.",
+                ),
                 ephemeral=True,
             )
             return
 
+        await buyer.arefresh_from_db(fields=["money"])
         if not buyer.can_afford(listing.price):
             await interaction.followup.send(
-                f"You can't afford this listing.\n"
-                f"Your balance: **{fmt_currency(buyer.money)}**\n"
-                f"Listing price: **{fmt_currency(listing.price)}**",
+                embed=error_embed(
+                    "Insufficient Funds",
+                    f"Your balance: **{fmt(buyer.money)}**\n"
+                    f"Listing price: **{fmt(listing.price)}**\n\n"
+                    f"You need **{fmt(listing.price - buyer.money)}** more.",
+                ),
                 ephemeral=True,
             )
             return
 
-        fee = int(listing.price * config.listing_platform_fee)
+        fee = int(listing.price * (cfg.listing_platform_fee if cfg else 0.05))
         seller_receives = listing.price - fee
+        seller = await Player.objects.aget(pk=listing.seller_id)
 
-        await Player.objects.filter(pk=buyer.pk).aupdate(money=buyer.money - listing.price)
-        seller = listing.seller
-        await Player.objects.filter(pk=seller.pk).aupdate(money=seller.money + seller_receives)
+        # Transfer money
+        await buyer.remove_money(listing.price)
+        await seller.add_money(seller_receives)
 
+        # Transfer ball ownership
         bi = listing.ball_instance
         bi.player = buyer
-        await bi.asave(update_fields=["player"])
+        bi.trade_player_id = listing.seller_id
+        await bi.asave(update_fields=["player", "trade_player"])
 
-        from django.utils import timezone
+        # Mark listing as sold
         listing.sold = True
         listing.buyer = buyer
         listing.sold_at = timezone.now()
         await listing.asave(update_fields=["sold", "buyer", "sold_at"])
 
         special_tag = (
-            f" — *{bi.specialcard.name}*" if bi.special_id and bi.specialcard else ""
+            f"\n*{bi.specialcard.name}*" if bi.special_id and bi.specialcard else ""
         )
+        atk = f"{bi.attack_bonus:+}%"
+        hp = f"{bi.health_bonus:+}%"
 
         embed = discord.Embed(
-            title="Purchase Successful",
+            title="Purchase Complete! 🎉",
             color=discord.Color.green(),
         )
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
         embed.add_field(
-            name=f"{settings.collectible_name.title()} Purchased",
+            name=f"{settings.collectible_name.title()} Acquired",
             value=f"**{bi.ball.country}**{special_tag}",
             inline=True,
         )
         embed.add_field(
-            name="You Paid",
-            value=fmt_currency(listing.price),
+            name="Stats",
+            value=f"ATK: {atk} | HP: {hp}",
             inline=True,
         )
-        embed.add_field(
-            name="New Balance",
-            value=fmt_currency(buyer.money - listing.price),
-            inline=True,
-        )
+        embed.add_field(name="\u200b", value="\u200b", inline=True)
+        embed.add_field(name="You Paid", value=fmt(listing.price), inline=True)
+        embed.add_field(name="New Balance", value=fmt(buyer.money - listing.price), inline=True)
         embed.set_footer(
-            text=f"Seller received {fmt_currency(seller_receives)} after the "
-                 f"{config.listing_platform_fee * 100:.0f}% platform fee."
+            text=f"Platform fee: {fmt(fee)} ({(cfg.listing_platform_fee if cfg else 0.05) * 100:.0f}%). "
+                 f"Seller received: {fmt(seller_receives)}."
         )
 
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+    # ── /economy delist ───────────────────────────────────────────────────────
 
     @economy_group.command(name="delist")
     @app_commands.describe(listing_id="The listing ID to remove.")
@@ -599,18 +724,12 @@ class Economy(commands.Cog):
         interaction: discord.Interaction["BallsDexBot"],
         listing_id: int,
     ) -> None:
-        """
-        Remove one of your active listings and get the ball back.
-        """
-        if not await self._check_currency(interaction):
+        """Remove one of your active listings. The ball stays in your collection."""
+        if not await self._guard_currency(interaction):
             return
 
-        try:
-            player = await Player.objects.aget(discord_id=interaction.user.id)
-        except Player.DoesNotExist:
-            await interaction.response.send_message(
-                "You don't have a player profile yet.", ephemeral=True
-            )
+        player = await self._get_player(interaction)
+        if player is None:
             return
 
         try:
@@ -619,7 +738,11 @@ class Economy(commands.Cog):
             ).aget(pk=listing_id, sold=False, seller=player)
         except BallListing.DoesNotExist:
             await interaction.response.send_message(
-                "That listing doesn't exist or doesn't belong to you.", ephemeral=True
+                embed=error_embed(
+                    "Listing Not Found",
+                    "That listing doesn't exist or doesn't belong to you.",
+                ),
+                ephemeral=True,
             )
             return
 
@@ -630,160 +753,163 @@ class Economy(commands.Cog):
             title="Listing Removed",
             color=discord.Color.orange(),
         )
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
         embed.add_field(
             name=f"{settings.collectible_name.title()} Returned",
             value=f"**{bi.ball.country}**",
             inline=True,
         )
         embed.set_footer(
-            text="Your ball has been returned to your collection."
+            text=f"Your {settings.collectible_name} is still in your collection."
         )
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
+    # ── /economy mylistings ───────────────────────────────────────────────────
+
     @economy_group.command(name="mylistings")
     async def mylistings(self, interaction: discord.Interaction["BallsDexBot"]) -> None:
-        """
-        View all of your active listings.
-        """
-        if not await self._check_currency(interaction):
+        """View all of your active listings on the market."""
+        if not await self._guard_currency(interaction):
             return
 
-        try:
-            player = await Player.objects.aget(discord_id=interaction.user.id)
-        except Player.DoesNotExist:
-            await interaction.response.send_message(
-                "You don't have a player profile yet.", ephemeral=True
-            )
+        player = await self._get_player(interaction)
+        if player is None:
             return
 
         active = await BallListing.objects.filter(
             seller=player, sold=False
-        ).select_related("ball_instance__ball", "ball_instance__special").alist()
+        ).select_related("ball_instance__ball", "ball_instance__special").order_by("price").alist()
 
         if not active:
             await interaction.response.send_message(
-                f"You have no active listings. "
-                f"Use `/economy list` to sell a {settings.collectible_name}!",
+                embed=discord.Embed(
+                    title="Your Listings",
+                    description=(
+                        "You have no active listings.\n"
+                        f"Use `/economy list <ball> <price>` to list a {settings.collectible_name}!"
+                    ),
+                    color=discord.Color.blurple(),
+                ),
                 ephemeral=True,
             )
             return
 
+        cfg = await get_economy_settings()
+        max_listings = cfg.listing_max_per_player if cfg else 10
+
         embed = discord.Embed(
-            title="Your Active Listings",
-            description=f"You have **{len(active)}** active listing{'s' if len(active) != 1 else ''}.",
+            title="Your Listings",
+            description=(
+                f"**{len(active)}/{max_listings}** active listing{'s' if len(active) != 1 else ''}.\n"
+                "Use `/economy delist <id>` to remove a listing."
+            ),
             color=discord.Color.blurple(),
         )
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
+
         for listing in active:
             bi = listing.ball_instance
-            special_tag = (
-                f" *{bi.specialcard.name}*" if bi.special_id and bi.specialcard else ""
-            )
+            special_tag = f" *[{bi.specialcard.name}]*" if bi.special_id and bi.specialcard else ""
             embed.add_field(
                 name=f"`#{listing.pk}` {bi.ball.country}{special_tag}",
                 value=(
-                    f"💰 **{fmt_currency(listing.price)}**\n"
-                    f"Expires: <t:{int(listing.expires_at.timestamp())}:R>"
+                    f"💰 **{fmt(listing.price)}**\n"
+                    f"ATK: {bi.attack_bonus:+}% | HP: {bi.health_bonus:+}%\n"
+                    f"Expires <t:{int(listing.expires_at.timestamp())}:R>"
                 ),
                 inline=True,
             )
-        embed.set_footer(text="Use /economy delist <id> to remove a listing.")
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    # ── Layer 3: Passive income claiming ─────────────────────────────────────
+    # ── /economy pending ──────────────────────────────────────────────────────
 
     @economy_group.command(name="pending")
     async def pending(self, interaction: discord.Interaction["BallsDexBot"]) -> None:
-        """
-        Check how much passive income is waiting to be claimed.
-        """
-        if not await self._check_currency(interaction):
+        """Check how much passive income is waiting to be claimed."""
+        if not await self._guard_currency(interaction):
             return
 
-        try:
-            player = await Player.objects.aget(discord_id=interaction.user.id)
-        except Player.DoesNotExist:
-            await interaction.response.send_message(
-                f"You don't have a player profile yet. "
-                f"Catch some {settings.plural_collectible_name} first!",
-                ephemeral=True,
-            )
+        cfg = await get_economy_settings()
+        if cfg and not await self._guard_command(interaction, cfg.pending_enabled, "/economy pending"):
+            return
+
+        player = await self._get_player(interaction)
+        if player is None:
             return
 
         try:
             pool = await PassiveIncomePool.objects.aget(player=player)
             pending = pool.pending
             last_tick = pool.last_tick
+            total_earned = pool.total_earned
         except PassiveIncomePool.DoesNotExist:
             pending = 0
             last_tick = None
+            total_earned = 0
 
-        config = self._config or await get_config()
+        ball_count = await BallInstance.objects.filter(player=player, deleted=False).acount()
 
         embed = discord.Embed(
             title="Passive Income",
             color=discord.Color.gold(),
         )
-        embed.add_field(
-            name="⏳ Pending",
-            value=fmt_currency(pending),
-            inline=True,
-        )
-        embed.add_field(
-            name="💰 Current Balance",
-            value=fmt_currency(player.money),
-            inline=True,
-        )
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        embed.add_field(name="⏳ Ready to Claim", value=fmt(pending), inline=True)
+        embed.add_field(name="💰 Current Balance", value=fmt(player.money), inline=True)
+        embed.add_field(name="📦 Balls Generating", value=str(ball_count), inline=True)
         if last_tick:
-            embed.add_field(
-                name="Last Tick",
-                value=f"<t:{int(last_tick.timestamp())}:R>",
-                inline=True,
-            )
-        if config:
+            embed.add_field(name="Last Tick", value=f"<t:{int(last_tick.timestamp())}:R>", inline=True)
+        if total_earned:
+            embed.add_field(name="Total Ever Earned", value=fmt(total_earned), inline=True)
+        if cfg:
             embed.set_footer(
                 text=(
-                    f"Each {settings.collectible_name} you own has a "
-                    f"{config.passive_chance * 100:.0f}% chance to generate "
-                    f"{config.passive_min}–{config.passive_max} {settings.currency_plural} "
-                    f"every {config.passive_interval_minutes} minutes."
+                    f"Each {settings.collectible_name} has a {cfg.passive_chance * 100:.0f}% chance "
+                    f"to generate {cfg.passive_min}–{cfg.passive_max}+ {settings.currency_plural} "
+                    f"every {cfg.passive_interval_minutes} minutes. "
+                    f"Use /economy claim to collect."
                 )
             )
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
+    # ── /economy claim ────────────────────────────────────────────────────────
+
     @economy_group.command(name="claim")
     async def claim(self, interaction: discord.Interaction["BallsDexBot"]) -> None:
-        """
-        Claim all of your accumulated passive income.
-        """
-        if not await self._check_currency(interaction):
+        """Collect all accumulated passive income into your balance."""
+        if not await self._guard_currency(interaction):
             return
 
-        try:
-            player = await Player.objects.aget(discord_id=interaction.user.id)
-        except Player.DoesNotExist:
-            await interaction.response.send_message(
-                f"You don't have a player profile yet. "
-                f"Catch some {settings.plural_collectible_name} first!",
-                ephemeral=True,
-            )
+        cfg = await get_economy_settings()
+        if cfg and not await self._guard_command(interaction, cfg.claim_enabled, "/economy claim"):
+            return
+
+        player = await self._get_player(interaction)
+        if player is None:
             return
 
         try:
             pool = await PassiveIncomePool.objects.aget(player=player)
         except PassiveIncomePool.DoesNotExist:
             await interaction.response.send_message(
-                f"You have no passive income to claim yet. "
-                f"Own some {settings.plural_collectible_name} and check back later!",
+                embed=error_embed(
+                    "Nothing to Claim",
+                    f"You have no passive income yet. "
+                    f"Own some {settings.plural_collectible_name} and wait for the next tick!",
+                ),
                 ephemeral=True,
             )
             return
 
         if pool.pending == 0:
             await interaction.response.send_message(
-                "No passive income to claim right now. Check back later!",
+                embed=error_embed(
+                    "Nothing to Claim",
+                    "No passive income to claim right now. Check back later!",
+                ),
                 ephemeral=True,
             )
             return
@@ -791,23 +917,15 @@ class Economy(commands.Cog):
         earned = pool.pending
         pool.pending = 0
         await pool.asave(update_fields=["pending"])
-        new_balance = player.money + earned
-        await Player.objects.filter(pk=player.pk).aupdate(money=new_balance)
+        await player.add_money(earned)
 
         embed = discord.Embed(
-            title=f"{settings.currency_name} Claimed!",
+            title=f"{settings.currency_name} Claimed! 💰",
             color=discord.Color.green(),
         )
-        embed.add_field(
-            name="💰 Claimed",
-            value=fmt_currency(earned),
-            inline=True,
-        )
-        embed.add_field(
-            name="New Balance",
-            value=fmt_currency(new_balance),
-            inline=True,
-        )
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        embed.add_field(name="Claimed", value=fmt(earned), inline=True)
+        embed.add_field(name="New Balance", value=fmt(player.money + earned), inline=True)
         embed.set_footer(
             text=f"Your {settings.plural_collectible_name} continue generating "
                  f"passive {settings.currency_plural} automatically."
