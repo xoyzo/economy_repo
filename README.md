@@ -2,34 +2,48 @@
 
 ```toml
 [[ballsdex.packages]]
-location = "git+https://github.com/yourname/economy.git@v1.0.0"
+location = "git+https://github.com/yourname/economy_repo.git@v1.0.0"
 path = "economy"
 enabled = true
 ```
 
 # Economy
 
-Three layered money earning systems for BallsDex.
+Three-layer currency earning system for BallsDex. All commands and features can be individually
+enabled or disabled from the admin panel.
 
-## Layer 1 — Catch Income
-Every catch automatically earns money scaled by the ball's rarity and whether it has a special.
-Configured via the `EconomyConfig` model in the admin panel.
+> ⚠️ **Currency must be enabled in bot settings first.**
+> Admin panel → Settings → set a Currency Name. All commands return a disabled
+> message until this is configured.
 
-## Layer 2 — Ball Selling
-- `/economy quicksell <ball>` — sell a ball instantly to the system for money based on rarity, special and stat rolls
-- `/economy list <ball> <price>` — list a ball for sale at a player-set price
-- `/economy listings` — browse all active player listings
-- `/economy buy <listing_id>` — buy a listed ball from another player
-- `/economy delist <listing_id>` — remove your own listing
+## How it works
 
-All quick sell rates are configurable in the admin panel.
+### Layer 1 — Catch Income
+Every catch automatically earns currency. Amount scales with ball rarity and whether it has
+a special. Uses a proper class-level monkeypatch on `BallSpawnView.catch_ball` so it works
+correctly on every catch without interfering with other packages.
 
-## Layer 3 — Passive Income
-Every ball you own has a configurable chance every 10 minutes to accumulate passive currency.
-Currency builds up in a claimable pool — it is not added automatically.
-- `/economy claim` — claim all accumulated passive income
-- `/economy pending` — check how much passive income is waiting to be claimed
+### Layer 2 — Ball Selling
+Two separate ways to sell:
+- **Quick sell** — sell instantly to the system at a calculated price
+- **Player market** — list at your own price, other players browse and buy
 
-## Admin Panel
-All rates, multipliers, passive chance and intervals are configured via `EconomyConfig` in the admin panel.
-Only one `EconomyConfig` record should exist — it applies globally.
+### Layer 3 — Passive Income
+Each ball you own has a configurable chance every N minutes to accumulate currency into a
+claimable pool. Players must run `/economy claim` to collect it.
+
+## Commands
+- `/economy balance` — view your balance and pending income
+- `/economy quicksell <ball>` — sell a ball to the system
+- `/economy list <ball> <price>` — list a ball for other players
+- `/economy listings` — browse all active listings
+- `/economy buy <id>` — purchase a listing
+- `/economy delist <id>` — cancel your own listing
+- `/economy mylistings` — view your own active listings
+- `/economy pending` — check unclaimed passive income
+- `/economy claim` — collect all pending passive income
+
+## Admin panel
+One `EconomyConfig` record is created automatically on install with sensible defaults.
+Every rate, toggle, multiplier and interval is configurable there.
+Individual commands can be disabled via the toggle fields on `EconomyConfig`.
