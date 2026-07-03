@@ -110,7 +110,7 @@ async def _patched_catch_ball(
     return ball, is_new
 
 
-class Economy(commands.Cog):
+class Economy(app_commands.GroupCog, name="economy"):
     """
     Economy package — catch income, quick sell, player market, passive income.
     Currency must be configured in bot settings for any commands to work.
