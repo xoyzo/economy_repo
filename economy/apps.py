@@ -11,11 +11,12 @@ class EconomyConfig(AppConfig):
 
 
 def _create_default_config(sender, **kwargs) -> None:
-    from .models import EconomyConfig
-    if not EconomyConfig.objects.exists():
-        EconomyConfig.objects.create()
-        import logging
-        logging.getLogger(__name__).info(
-            "Economy: created default EconomyConfig record. "
-            "Adjust rates in the admin panel."
+    from .models import EconomySettings
+    import logging
+    log = logging.getLogger(__name__)
+    if not EconomySettings.objects.exists():
+        EconomySettings.objects.create()
+        log.info(
+            "Economy: created default EconomySettings record with default values. "
+            "Adjust rates in the admin panel under Economy > Economy Settings."
         )
