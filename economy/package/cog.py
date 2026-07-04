@@ -11,12 +11,13 @@ from discord.ext import commands, tasks
 from django.utils import timezone
 
 from ballsdex.core.utils.transformers import BallInstanceTransformer
+from ballsdex.core.utils.utils import is_staff
 from ballsdex.packages.countryballs.countryball import BallSpawnView
 from bd_models.models import BallInstance, Player
 from settings.models import settings
 from settings.utils import format_currency
 
-from ..models import BallListing, BallSellPrice, EconomySettings, PassiveIncomePool
+from ..models import BallListing, BallSellPrice, BallShopPrice, EconomySettings, PassiveIncomePool
 
 if TYPE_CHECKING:
     from ballsdex.core.bot import BallsDexBot
@@ -111,10 +112,10 @@ async def _patched_catch_ball(
 
 
 class Economy(commands.GroupCog, group_name="economy"):
-    """
-    Economy package — catch income, quick sell, player market, passive income.
-    Currency must be configured in bot settings for any commands to work.
-    """
+    """Economy commands — earn currency, sell balls and manage your balance."""
+
+    # /economy admin subgroup — staff only
+    admin = economy_admin_group
 
     def __init__(self, bot: "BallsDexBot") -> None:
         self.bot = bot
@@ -126,13 +127,8 @@ class Economy(commands.GroupCog, group_name="economy"):
         BallSpawnView.catch_ball = _patched_catch_ball  # type: ignore[method-assign]
         log.info("Economy: BallSpawnView.catch_ball monkeypatched for catch income.")
 
-        # Hook /admin economy into the existing Admin cog if loaded
-        admin_cog = self.bot.get_cog("Admin")
-        if admin_cog is not None:
-            admin_cog.admin.add_command(economy_admin_group)
-            log.info("Economy: /admin economy commands added.")
-        else:
-            log.warning("Economy: Admin cog not found — /admin economy commands not registered.")
+        # /economy admin subgroup is already part of this GroupCog via class definition
+        log.info("Economy: /economy admin commands available.")
 
         # All DB work happens in _post_init after bot is ready
         self.bot.loop.create_task(self._post_init())
@@ -172,10 +168,7 @@ class Economy(commands.GroupCog, group_name="economy"):
         BallSpawnView.catch_ball = _original_catch_ball  # type: ignore[method-assign]
         self.passive_income_task.cancel()
         self.expire_listings_task.cancel()
-        # Remove /admin economy commands
-        admin_cog = self.bot.get_cog("Admin")
-        if admin_cog is not None:
-            admin_cog.admin.remove_command("economy")
+        # /economy admin is part of this cog — nothing extra to remove
         log.info("Economy: BallSpawnView.catch_ball restored.")
 
     # ── Guards ────────────────────────────────────────────────────────────────
@@ -259,7 +252,7 @@ class Economy(commands.GroupCog, group_name="economy"):
         now = timezone.now()
         expired = await BallListing.objects.filter(
             sold=False, expires_at__lte=now
-        ).select_related("ball_instance", "seller").alist()
+        ).select_related("ball_instance", "seller").aall()
 
         for listing in expired:
             # Ball stays with the seller since they still own it — just delete the listing
@@ -359,6 +352,7 @@ class Economy(commands.GroupCog, group_name="economy"):
         ball.deleted = True
         await ball.asave(update_fields=["deleted"])
         await player.add_money(price)
+        await player.arefresh_from_db(fields=["money"])
 
         embed = discord.Embed(
             title=f"{settings.collectible_name.title()} Sold",
@@ -376,7 +370,7 @@ class Economy(commands.GroupCog, group_name="economy"):
             inline=True,
         )
         embed.add_field(name="You Received", value=fmt(price), inline=True)
-        embed.add_field(name="New Balance", value=fmt(player.money + price), inline=False)
+        embed.add_field(name="New Balance", value=fmt(player.money), inline=False)
         embed.set_footer(
             text=(
                 "Quick sell prices are set per ball in the admin panel. "
@@ -543,7 +537,7 @@ class Economy(commands.GroupCog, group_name="economy"):
             "ball_instance__ball",
             "ball_instance__special",
             "seller",
-        ).order_by("price")[offset:offset + per_page].alist()
+        ).order_by("price")[offset:offset + per_page].aall()
 
         total_pages = max(1, (total + per_page - 1) // per_page)
         page = max(1, min(page, total_pages))
@@ -684,8 +678,9 @@ class Economy(commands.GroupCog, group_name="economy"):
             inline=True,
         )
         embed.add_field(name="\u200b", value="\u200b", inline=True)
+        await buyer.arefresh_from_db(fields=["money"])
         embed.add_field(name="You Paid", value=fmt(listing.price), inline=True)
-        embed.add_field(name="New Balance", value=fmt(buyer.money - listing.price), inline=True)
+        embed.add_field(name="New Balance", value=fmt(buyer.money), inline=True)
         embed.set_footer(
             text=f"Platform fee: {fmt(fee)} ({(cfg.listing_platform_fee if cfg else 0.05) * 100:.0f}%). "
                  f"Seller received: {fmt(seller_receives)}."
@@ -757,7 +752,7 @@ class Economy(commands.GroupCog, group_name="economy"):
 
         active = await BallListing.objects.filter(
             seller=player, sold=False
-        ).select_related("ball_instance__ball", "ball_instance__special").order_by("price").alist()
+        ).select_related("ball_instance__ball", "ball_instance__special").order_by("price").aall()
 
         if not active:
             await interaction.response.send_message(
@@ -896,6 +891,8 @@ class Economy(commands.GroupCog, group_name="economy"):
         pool.pending = 0
         await pool.asave(update_fields=["pending"])
         await player.add_money(earned)
+        # Re-fetch to get accurate post-add balance
+        await player.arefresh_from_db(fields=["money"])
 
         embed = discord.Embed(
             title=f"{settings.currency_name} Claimed! 💰",
@@ -903,7 +900,7 @@ class Economy(commands.GroupCog, group_name="economy"):
         )
         embed.set_thumbnail(url=interaction.user.display_avatar.url)
         embed.add_field(name="Claimed", value=fmt(earned), inline=True)
-        embed.add_field(name="New Balance", value=fmt(player.money + earned), inline=True)
+        embed.add_field(name="New Balance", value=fmt(player.money), inline=True)
         embed.set_footer(
             text=f"Your {settings.plural_collectible_name} continue generating "
                  f"passive {settings.currency_plural} automatically."
@@ -912,20 +909,146 @@ class Economy(commands.GroupCog, group_name="economy"):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+
+    @app_commands.command(name="shop")
+    async def shop(self, interaction: discord.Interaction["BallsDexBot"]) -> None:
+        """Browse balls available to buy directly from the shop."""
+        if not await self._guard_currency(interaction):
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        items = await BallShopPrice.objects.filter(
+            enabled=True
+        ).select_related("ball", "special").order_by("price").aall()
+
+        if not items:
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="Ball Shop",
+                    description="The shop is empty right now. Check back later!",
+                    color=discord.Color.blurple(),
+                ),
+                ephemeral=True,
+            )
+            return
+
+        embed = discord.Embed(
+            title="🏪 Ball Shop",
+            description=(
+                f"Buy {settings.plural_collectible_name} directly with {settings.currency_plural}. "
+                f"Use `/economy buy_ball <id>` to purchase."
+            ),
+            color=discord.Color.blurple(),
+        )
+
+        for item in items[:20]:
+            special_tag = f" *[{item.special.name}]*" if item.special_id and item.special else ""
+            stock_text = f"Stock: {item.stock}" if item.stock >= 0 else "Stock: ∞"
+            embed.add_field(
+                name=f"`#{item.pk}` {item.ball.country}{special_tag}",
+                value=f"💰 **{fmt(item.price)}**{stock_text}",
+                inline=True,
+            )
+
+        embed.set_footer(text=f"Prices set by server administrators.")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="buy_ball")
+    @app_commands.describe(shop_id="The shop item ID from /economy shop.")
+    async def buy_ball(
+        self,
+        interaction: discord.Interaction["BallsDexBot"],
+        shop_id: int,
+    ) -> None:
+        """Buy a ball directly from the shop at the listed price."""
+        if not await self._guard_currency(interaction):
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            item = await BallShopPrice.objects.select_related("ball", "special").aget(
+                pk=shop_id, enabled=True
+            )
+        except BallShopPrice.DoesNotExist:
+            await interaction.followup.send(
+                embed=error_embed("Not Found", "That shop item doesn't exist or is no longer available."),
+                ephemeral=True,
+            )
+            return
+
+        if item.stock == 0:
+            await interaction.followup.send(
+                embed=error_embed("Out of Stock", f"**{item.ball.country}** is sold out."),
+                ephemeral=True,
+            )
+            return
+
+        player = await self._get_player(interaction)
+        if player is None:
+            return
+
+        await player.arefresh_from_db(fields=["money"])
+        if not player.can_afford(item.price):
+            await interaction.followup.send(
+                embed=error_embed(
+                    "Insufficient Funds",
+                    f"This costs {fmt(item.price)} but you only have {fmt(player.money)}.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        # Deduct money
+        await player.remove_money(item.price)
+
+        # Create the ball instance
+        new_ball = await BallInstance.objects.acreate(
+            ball=item.ball,
+            player=player,
+            special=item.special,
+            server_id=interaction.guild_id,
+        )
+
+        # Decrement stock if limited
+        if item.stock > 0:
+            item.stock -= 1
+            if item.stock == 0:
+                item.enabled = False
+            await item.asave(update_fields=["stock", "enabled"])
+
+        await player.arefresh_from_db(fields=["money"])
+        special_tag = f"\n*{item.special.name}*" if item.special_id and item.special else ""
+
+        embed = discord.Embed(
+            title=f"{settings.collectible_name.title()} Purchased! 🎉",
+            color=discord.Color.green(),
+        )
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        embed.add_field(
+            name=f"{settings.collectible_name.title()} Received",
+            value=f"**{item.ball.country}**{special_tag}",
+            inline=True,
+        )
+        embed.add_field(name="You Paid", value=fmt(item.price), inline=True)
+        embed.add_field(name="New Balance", value=fmt(player.money), inline=True)
+        embed.set_footer(text=f"Check your collection with /balls.")
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
 # ── /admin economy commands ───────────────────────────────────────────────────
 # Attached to the Admin cog's hybrid group in Economy.cog_load()
 
-from ballsdex.core.utils import checks as _checks
-
-@commands.hybrid_group(name="economy")
-@_checks.has_permissions("bd_models.view_player")
-async def economy_admin_group(ctx: commands.Context["BallsDexBot"]):
-    """Economy management tools."""
-    await ctx.send_help(ctx.command)
+economy_admin_group = app_commands.Group(
+    name="admin",
+    description="Economy management tools for staff.",
+)
 
 
+@app_commands.check(is_staff)
 @economy_admin_group.command(name="view")
-@_checks.has_permissions("bd_models.view_player")
 async def admin_economy_view(ctx: commands.Context["BallsDexBot"], user: discord.User):
     """
     View the full economy profile of a player.
@@ -972,8 +1095,8 @@ async def admin_economy_view(ctx: commands.Context["BallsDexBot"], user: discord
     await ctx.send(embed=embed, ephemeral=True)
 
 
+@app_commands.check(is_staff)
 @economy_admin_group.command(name="give")
-@_checks.has_permissions("bd_models.change_player")
 async def admin_economy_give(ctx: commands.Context["BallsDexBot"], user: discord.User, amount: int):
     """
     Give currency to a player.
@@ -993,12 +1116,13 @@ async def admin_economy_give(ctx: commands.Context["BallsDexBot"], user: discord
         await ctx.send(f"This user does not have a {settings.bot_name} account.", ephemeral=True)
         return
     await player.add_money(amount)
-    await ctx.send(f"Gave {fmt(amount)} to {user.mention}. New balance: {fmt(player.money + amount)}.", ephemeral=True)
+    await player.arefresh_from_db(fields=["money"])
+    await ctx.send(f"Gave {fmt(amount)} to {user.mention}. New balance: {fmt(player.money)}.", ephemeral=True)
     log.info(f"{ctx.author} gave {amount} to {user} ({user.id})", extra={"webhook": True})
 
 
+@app_commands.check(is_staff)
 @economy_admin_group.command(name="take")
-@_checks.has_permissions("bd_models.change_player")
 async def admin_economy_take(ctx: commands.Context["BallsDexBot"], user: discord.User, amount: int):
     """
     Remove currency from a player.
@@ -1024,12 +1148,13 @@ async def admin_economy_take(ctx: commands.Context["BallsDexBot"], user: discord
         )
         return
     await player.remove_money(amount)
-    await ctx.send(f"Removed {fmt(amount)} from {user.mention}. New balance: {fmt(player.money - amount)}.", ephemeral=True)
+    await player.arefresh_from_db(fields=["money"])
+    await ctx.send(f"Removed {fmt(amount)} from {user.mention}. New balance: {fmt(player.money)}.", ephemeral=True)
     log.info(f"{ctx.author} removed {amount} from {user} ({user.id})", extra={"webhook": True})
 
 
+@app_commands.check(is_staff)
 @economy_admin_group.command(name="set")
-@_checks.has_permissions("bd_models.change_player")
 async def admin_economy_set(ctx: commands.Context["BallsDexBot"], user: discord.User, amount: int):
     """
     Set a player's balance to an exact amount.
@@ -1055,8 +1180,8 @@ async def admin_economy_set(ctx: commands.Context["BallsDexBot"], user: discord.
     log.info(f"{ctx.author} set balance of {user} ({user.id}) from {old} to {amount}", extra={"webhook": True})
 
 
+@app_commands.check(is_staff)
 @economy_admin_group.command(name="giveall")
-@_checks.has_permissions("bd_models.change_player")
 async def admin_economy_giveall(ctx: commands.Context["BallsDexBot"], amount: int):
     """
     Give currency to every player in the database.
@@ -1078,8 +1203,8 @@ async def admin_economy_giveall(ctx: commands.Context["BallsDexBot"], amount: in
     log.info(f"{ctx.author} gave {amount} to all {count} players", extra={"webhook": True})
 
 
+@app_commands.check(is_staff)
 @economy_admin_group.command(name="stats")
-@_checks.has_permissions("bd_models.view_player")
 async def admin_economy_stats(ctx: commands.Context["BallsDexBot"]):
     """View server-wide economy statistics."""
     await ctx.defer(ephemeral=True)
@@ -1095,7 +1220,7 @@ async def admin_economy_stats(ctx: commands.Context["BallsDexBot"]):
     total_sold = await BallListing.objects.filter(sold=True).acount()
     sold_agg = await BallListing.objects.filter(sold=True).aaggregate(total=Sum("price"))
     total_volume = sold_agg["total"] or 0
-    top_players = await Player.objects.order_by("-money").values_list("discord_id", "money")[:5].alist()
+    top_players = await Player.objects.order_by("-money").values_list("discord_id", "money")[:5].aall()
 
     embed = discord.Embed(title="Economy Statistics", color=discord.Color.gold())
     embed.add_field(name="💰 Total In Circulation", value=fmt(total_money), inline=True)
@@ -1113,8 +1238,8 @@ async def admin_economy_stats(ctx: commands.Context["BallsDexBot"]):
     await ctx.send(embed=embed, ephemeral=True)
 
 
+@app_commands.check(is_staff)
 @economy_admin_group.command(name="resetpassive")
-@_checks.has_permissions("bd_models.change_player")
 async def admin_economy_resetpassive(ctx: commands.Context["BallsDexBot"], user: discord.User):
     """
     Reset a player's pending passive income pool to 0.
@@ -1139,8 +1264,8 @@ async def admin_economy_resetpassive(ctx: commands.Context["BallsDexBot"], user:
         await ctx.send(f"{user.mention} has no passive pool.", ephemeral=True)
 
 
+@app_commands.check(is_staff)
 @economy_admin_group.command(name="clearlistings")
-@_checks.has_permissions("bd_models.change_player")
 async def admin_economy_clearlistings(ctx: commands.Context["BallsDexBot"], user: discord.User):
     """
     Remove all active listings from a player and return their balls.
@@ -1154,7 +1279,7 @@ async def admin_economy_clearlistings(ctx: commands.Context["BallsDexBot"], user
     if not player:
         await ctx.send(f"This user does not have a {settings.bot_name} account.", ephemeral=True)
         return
-    listings = await BallListing.objects.filter(seller=player, sold=False).alist()
+    listings = await BallListing.objects.filter(seller=player, sold=False).aall()
     if not listings:
         await ctx.send(f"{user.mention} has no active listings.", ephemeral=True)
         return
@@ -1168,8 +1293,8 @@ async def admin_economy_clearlistings(ctx: commands.Context["BallsDexBot"], user
     log.info(f"{ctx.author} cleared {count} listings for {user} ({user.id})", extra={"webhook": True})
 
 
+@app_commands.check(is_staff)
 @economy_admin_group.command(name="removelisting")
-@_checks.has_permissions("bd_models.change_player")
 async def admin_economy_removelisting(ctx: commands.Context["BallsDexBot"], listing_id: int):
     """
     Forcibly remove any specific listing by ID.
@@ -1194,8 +1319,8 @@ async def admin_economy_removelisting(ctx: commands.Context["BallsDexBot"], list
     log.info(f"{ctx.author} force-removed listing #{listing_id} ({ball_name}) from {seller_id}", extra={"webhook": True})
 
 
+@app_commands.check(is_staff)
 @economy_admin_group.command(name="forcepassive")
-@_checks.has_permissions("bd_models.change_player")
 async def admin_economy_forcepassive(ctx: commands.Context["BallsDexBot"]):
     """Manually trigger a passive income tick for all players right now."""
     await ctx.defer(ephemeral=True)
@@ -1229,8 +1354,8 @@ async def admin_economy_forcepassive(ctx: commands.Context["BallsDexBot"]):
     log.info(f"{ctx.author} triggered manual passive tick: {total_generated} for {players_updated} players", extra={"webhook": True})
 
 
+@app_commands.check(is_staff)
 @economy_admin_group.command(name="history")
-@_checks.has_permissions("bd_models.view_player")
 async def admin_economy_history(ctx: commands.Context["BallsDexBot"], user: discord.User):
     """
     View a player's recent market sale and purchase history.
@@ -1247,11 +1372,11 @@ async def admin_economy_history(ctx: commands.Context["BallsDexBot"], user: disc
 
     sold = await BallListing.objects.filter(
         seller=player, sold=True
-    ).select_related("ball_instance__ball", "ball_instance__special").order_by("-sold_at")[:10].alist()
+    ).select_related("ball_instance__ball", "ball_instance__special").order_by("-sold_at")[:10].aall()
 
     bought = await BallListing.objects.filter(
         buyer=player, sold=True
-    ).select_related("ball_instance__ball", "ball_instance__special").order_by("-sold_at")[:10].alist()
+    ).select_related("ball_instance__ball", "ball_instance__special").order_by("-sold_at")[:10].aall()
 
     embed = discord.Embed(title=f"Market History — {user.display_name}", color=discord.Color.blurple())
     embed.set_thumbnail(url=user.display_avatar.url)
