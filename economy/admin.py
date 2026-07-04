@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import BallListing, BallSellPrice, EconomySettings, PassiveIncomePool
+from .models import BallListing, BallSellPrice, BallShopPrice, EconomySettings, PassiveIncomePool
 
 
 @admin.register(EconomySettings)
@@ -110,3 +110,11 @@ class PassiveIncomePoolAdmin(admin.ModelAdmin):
     search_fields = ("player__discord_id",)
     readonly_fields = ("player", "total_earned", "last_tick")
     ordering = ("-pending",)
+
+
+@admin.register(BallShopPrice)
+class BallShopPriceAdmin(admin.ModelAdmin):
+    list_display = ("ball", "special", "price", "stock", "enabled")
+    list_filter = ("enabled",)
+    search_fields = ("ball__country",)
+    autocomplete_fields = ("ball", "special")
