@@ -120,6 +120,16 @@ class Economy(commands.Cog):
         self.bot = bot
 
     async def cog_load(self) -> None:
+        # Apply monkeypatch immediately — no DB access here so cog always loads
+        # and commands always register with Discord successfully.
+        BallSpawnView.catch_ball = _patched_catch_ball  # type: ignore[method-assign]
+        log.info("Economy: BallSpawnView.catch_ball monkeypatched for catch income.")
+        # All DB work happens in _post_init after bot is ready
+        self.bot.loop.create_task(self._post_init())
+
+    async def _post_init(self) -> None:
+        """Runs after bot is ready. Safe to do DB work here."""
+        await self.bot.wait_until_ready()
         invalidate_settings_cache()
 
         if not currency_enabled():
@@ -128,36 +138,21 @@ class Economy(commands.Cog):
                 "All economy commands will be disabled until it is configured."
             )
 
-        # Try to load config — if table missing, log clearly and continue safely
         try:
             cfg = await get_economy_settings()
+            if cfg is None:
+                from ..models import EconomySettings as ES
+                cfg = await ES.objects.acreate()
+                log.info("Economy: created default EconomySettings record.")
         except Exception:
             log.error(
-                "Economy: failed to read EconomySettings — table may not exist yet. "
-                "Run migrations: "
-                "docker compose run --rm migration python3 -m django migrate economy zero --fake "
-                "&& docker compose run --rm migration python3 -m django migrate economy",
+                "Economy: failed to read EconomySettings — table may not exist. "
+                "Run: docker compose run --rm migration python3 -m django migrate economy zero --fake"
+                " && docker compose run --rm migration python3 -m django migrate economy",
                 exc_info=True,
             )
             cfg = None
 
-        if cfg is None and currency_enabled():
-            # Table exists but no record — create default
-            try:
-                from ..models import EconomySettings as ES
-                cfg = await ES.objects.afirst()
-                if cfg is None:
-                    cfg = await ES.objects.acreate()
-                    log.info("Economy: created default EconomySettings record.")
-            except Exception:
-                log.error("Economy: could not create EconomySettings record.", exc_info=True)
-                cfg = None
-
-        # Always apply the monkeypatch — it guards itself if config is None
-        BallSpawnView.catch_ball = _patched_catch_ball  # type: ignore[method-assign]
-        log.info("Economy: BallSpawnView.catch_ball monkeypatched for catch income.")
-
-        # Start background tasks — they guard themselves against missing config
         interval = cfg.passive_interval_minutes if cfg else 10
         self.passive_income_task.change_interval(minutes=interval)
         self.passive_income_task.start()
@@ -244,9 +239,7 @@ class Economy(commands.Cog):
                 pool.last_tick = timezone.now()
                 await pool.asave(update_fields=["pending", "total_earned", "last_tick"])
 
-    @passive_income_task.before_loop
-    async def before_passive(self) -> None:
-        await self.bot.wait_until_ready()
+
 
     @tasks.loop(minutes=15)
     async def expire_listings_task(self) -> None:
@@ -265,9 +258,7 @@ class Economy(commands.Cog):
                 listing.seller.discord_id,
             )
 
-    @expire_listings_task.before_loop
-    async def before_expire(self) -> None:
-        await self.bot.wait_until_ready()
+
 
     # ── Command group ─────────────────────────────────────────────────────────
 
