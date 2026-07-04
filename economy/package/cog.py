@@ -110,7 +110,7 @@ async def _patched_catch_ball(
     return ball, is_new
 
 
-class Economy(app_commands.GroupCog, name="economy"):
+class Economy(commands.Cog):
     """
     Economy package — catch income, quick sell, player market, passive income.
     Currency must be configured in bot settings for any commands to work.
@@ -120,24 +120,7 @@ class Economy(app_commands.GroupCog, name="economy"):
         self.bot = bot
 
     async def cog_load(self) -> None:
-        # Check table exists before any DB query — guards against loading before migrations run
-        from django.db import connection
-        from asgiref.sync import sync_to_async
-        get_table_names = sync_to_async(connection.introspection.table_names)
-        table_names = await get_table_names()
-        if "economy_settings" not in table_names:
-            log.error(
-                "Economy: economy_settings table missing. "
-                "Run: docker compose run --rm migration python3 -m django migrate economy zero --fake "
-                "then: docker compose run --rm migration python3 -m django migrate economy"
-            )
-            BallSpawnView.catch_ball = _patched_catch_ball  # type: ignore[method-assign]
-            self.passive_income_task.start()
-            self.expire_listings_task.start()
-            return
-
         invalidate_settings_cache()
-        cfg = await get_economy_settings()
 
         if not currency_enabled():
             log.warning(
@@ -145,17 +128,38 @@ class Economy(app_commands.GroupCog, name="economy"):
                 "All economy commands will be disabled until it is configured."
             )
 
-        if cfg is None:
-            log.warning("Economy: no EconomySettings record found — creating with defaults.")
-            from ..models import EconomySettings as ES
-            cfg = await ES.objects.acreate()
+        # Try to load config — if table missing, log clearly and continue safely
+        try:
+            cfg = await get_economy_settings()
+        except Exception:
+            log.error(
+                "Economy: failed to read EconomySettings — table may not exist yet. "
+                "Run migrations: "
+                "docker compose run --rm migration python3 -m django migrate economy zero --fake "
+                "&& docker compose run --rm migration python3 -m django migrate economy",
+                exc_info=True,
+            )
+            cfg = None
 
-        # Patch BallSpawnView at the class level — works for all spawn paths
+        if cfg is None and currency_enabled():
+            # Table exists but no record — create default
+            try:
+                from ..models import EconomySettings as ES
+                cfg = await ES.objects.afirst()
+                if cfg is None:
+                    cfg = await ES.objects.acreate()
+                    log.info("Economy: created default EconomySettings record.")
+            except Exception:
+                log.error("Economy: could not create EconomySettings record.", exc_info=True)
+                cfg = None
+
+        # Always apply the monkeypatch — it guards itself if config is None
         BallSpawnView.catch_ball = _patched_catch_ball  # type: ignore[method-assign]
         log.info("Economy: BallSpawnView.catch_ball monkeypatched for catch income.")
 
-        # Start background tasks with correct interval
-        self.passive_income_task.change_interval(minutes=cfg.passive_interval_minutes)
+        # Start background tasks — they guard themselves against missing config
+        interval = cfg.passive_interval_minutes if cfg else 10
+        self.passive_income_task.change_interval(minutes=interval)
         self.passive_income_task.start()
         self.expire_listings_task.start()
 
@@ -273,44 +277,6 @@ class Economy(app_commands.GroupCog, name="economy"):
     )
 
     # ── /economy balance ──────────────────────────────────────────────────────
-
-    @economy_group.command(name="balance")
-    async def balance(self, interaction: discord.Interaction["BallsDexBot"]) -> None:
-        """Check your current currency balance and pending passive income."""
-        if not await self._guard_currency(interaction):
-            return
-
-        cfg = await get_economy_settings()
-        if cfg and not await self._guard_command(interaction, cfg.balance_enabled, "/economy balance"):
-            return
-
-        player = await self._get_player(interaction)
-        if player is None:
-            return
-
-        try:
-            pool = await PassiveIncomePool.objects.aget(player=player)
-            pending = pool.pending
-            total_earned = pool.total_earned
-        except PassiveIncomePool.DoesNotExist:
-            pending = 0
-            total_earned = 0
-
-        active_listings = await BallListing.objects.filter(seller=player, sold=False).acount()
-
-        embed = discord.Embed(
-            title=f"{interaction.user.display_name}'s Balance",
-            color=discord.Color.gold(),
-        )
-        embed.set_thumbnail(url=interaction.user.display_avatar.url)
-        embed.add_field(name="💰 Balance", value=fmt(player.money), inline=True)
-        embed.add_field(name="⏳ Pending Income", value=fmt(pending), inline=True)
-        embed.add_field(name="📊 Active Listings", value=str(active_listings), inline=True)
-        if total_earned:
-            embed.add_field(name="📈 Total Passive Earned", value=fmt(total_earned), inline=True)
-        embed.set_footer(text=f"Use /economy claim to collect pending {settings.currency_plural}.")
-
-        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # ── /economy quicksell ────────────────────────────────────────────────────
 
