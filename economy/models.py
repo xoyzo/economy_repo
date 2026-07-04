@@ -278,3 +278,38 @@ class PassiveIncomePool(models.Model):
 
     def __str__(self) -> str:
         return f"{self.player} — {self.pending} pending"
+
+
+class BallShopPrice(models.Model):
+    """
+    Admin-configured shop listing — players can buy a ball directly for a set price.
+    Unlike BallSellPrice (which controls quick sell), this creates a buyable item in the shop.
+    """
+    ball = models.ForeignKey(
+        "bd_models.Ball",
+        on_delete=models.CASCADE,
+        related_name="shop_prices",
+    )
+    price = models.PositiveBigIntegerField()
+    stock = models.IntegerField(
+        default=-1,
+    )
+    enabled = models.BooleanField(default=True)
+    special = models.ForeignKey(
+        "bd_models.Special",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="shop_prices",
+    )
+
+    objects: Manager[Self] = Manager()
+
+    class Meta:
+        managed = True
+        db_table = "economy_ball_shop_price"
+        verbose_name = "Ball Shop Price"
+        verbose_name_plural = "Ball Shop Prices"
+
+    def __str__(self) -> str:
+        return f"{self.ball.country} — {self.price}"
