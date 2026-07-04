@@ -80,7 +80,6 @@ class EconomySettingsAdmin(admin.ModelAdmin):
             {
                 "description": "Individually enable or disable specific player-facing commands.",
                 "fields": (
-                    "balance_enabled",
                     "pending_enabled",
                     "claim_enabled",
                 ),
