@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import random
 from datetime import timedelta
@@ -327,7 +329,7 @@ class Economy(commands.GroupCog, group_name="economy"):
 
         total_pages = max(1, (total + per_page - 1) // per_page)
         page = max(1, min(page, total_pages))
-        active = await BallListing.objects.filter(sold=False).select_related("ball_instance__ball", "ball_instance__special", "seller").order_by("price")[offset:offset + per_page].aall()
+        active = [obj async for obj in BallListing.objects.filter(sold=False).select_related("ball_instance__ball", "ball_instance__special", "seller").order_by("price")[offset:offset + per_page]]
 
         embed = discord.Embed(
             title=f"{settings.plural_collectible_name.title()} Market",
@@ -446,7 +448,7 @@ class Economy(commands.GroupCog, group_name="economy"):
             return
 
         cfg = await self._get_cfg()
-        active = await BallListing.objects.filter(seller=player, sold=False).select_related("ball_instance__ball", "ball_instance__special").order_by("price").aall()
+        active = [obj async for obj in BallListing.objects.filter(seller=player, sold=False).select_related("ball_instance__ball", "ball_instance__special").order_by("price")]
 
         if not active:
             await interaction.response.send_message(embed=discord.Embed(title="Your Listings", description=f"You have no active listings.\nUse `/economy list <ball> <price>` to sell a {settings.collectible_name}!", color=discord.Color.blurple()), ephemeral=True)
@@ -473,7 +475,7 @@ class Economy(commands.GroupCog, group_name="economy"):
         if not await self._guard_currency(interaction):
             return
         await interaction.response.defer(ephemeral=True)
-        items = await BallShopPrice.objects.filter(enabled=True).select_related("ball", "special").order_by("price").aall()
+        items = [obj async for obj in BallShopPrice.objects.filter(enabled=True).select_related("ball", "special").order_by("price")]
 
         if not items:
             await interaction.followup.send(embed=discord.Embed(title="Ball Shop", description="The shop is empty right now. Check back later!", color=discord.Color.blurple()), ephemeral=True)
@@ -751,7 +753,7 @@ class Economy(commands.GroupCog, group_name="economy"):
         total_sold = await BallListing.objects.filter(sold=True).acount()
         sold_agg = await BallListing.objects.filter(sold=True).aaggregate(total=Sum("price"))
         total_volume = sold_agg["total"] or 0
-        top_players = await Player.objects.order_by("-money").values_list("discord_id", "money")[:5].aall()
+        top_players = [obj async for obj in Player.objects.order_by("-money").values_list("discord_id", "money")[:5]]
 
         embed = discord.Embed(title="Economy Statistics", color=discord.Color.gold())
         embed.add_field(name="💰 Total In Circulation", value=fmt(total_money), inline=True)
@@ -797,7 +799,7 @@ class Economy(commands.GroupCog, group_name="economy"):
         if not player:
             await interaction.response.send_message(embed=error_embed("No Account", f"{user} does not have a {settings.bot_name} account."), ephemeral=True)
             return
-        listings = await BallListing.objects.filter(seller=player, sold=False).aall()
+        listings = [obj async for obj in BallListing.objects.filter(seller=player, sold=False)]
         if not listings:
             await interaction.response.send_message(embed=error_embed("No Listings", f"{user.mention} has no active listings."), ephemeral=True)
             return
@@ -871,8 +873,8 @@ class Economy(commands.GroupCog, group_name="economy"):
             await interaction.followup.send(embed=error_embed("No Account", f"{user} does not have a {settings.bot_name} account."), ephemeral=True)
             return
 
-        sold = await BallListing.objects.filter(seller=player, sold=True).select_related("ball_instance__ball", "ball_instance__special").order_by("-sold_at")[:10].aall()
-        bought = await BallListing.objects.filter(buyer=player, sold=True).select_related("ball_instance__ball", "ball_instance__special").order_by("-sold_at")[:10].aall()
+        sold = [obj async for obj in BallListing.objects.filter(seller=player, sold=True).select_related("ball_instance__ball", "ball_instance__special").order_by("-sold_at")[:10]]
+        bought = [obj async for obj in BallListing.objects.filter(buyer=player, sold=True).select_related("ball_instance__ball", "ball_instance__special").order_by("-sold_at")[:10]]
 
         embed = discord.Embed(title=f"Market History — {user.display_name}", color=discord.Color.blurple())
         embed.set_thumbnail(url=user.display_avatar.url)
@@ -886,4 +888,3 @@ class Economy(commands.GroupCog, group_name="economy"):
         embed.add_field(name="📤 Recent Sales", value="\n".join(fmt_listing(l) for l in sold) or "None.", inline=False)
         embed.add_field(name="📥 Recent Purchases", value="\n".join(fmt_listing(l) for l in bought) or "None.", inline=False)
         await interaction.followup.send(embed=embed, ephemeral=True)
-
