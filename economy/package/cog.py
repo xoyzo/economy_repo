@@ -1,29 +1,23 @@
 import logging
-import random
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
 import discord
 from discord import app_commands
-from discord.ext import commands, tasks
+from discord.ext import commands
 from django.db.models import Sum
 from django.utils import timezone
 
 from ballsdex.core.utils.transformers import BallInstanceTransformer
 from ballsdex.core.utils.utils import is_staff
-from ballsdex.packages.countryballs.countryball import BallSpawnView
 from bd_models.models import BallInstance, Player
 from settings.models import settings
-from settings.utils import format_currency
 
-from ..models import (
-    BallListing,
-    BallSellPrice,
-    BallShopPrice,
-    EconomySettings,
-    PassiveIncomePool,
-    SpecialEconomyBonus,
-)
+from ..models import BallListing, BallSellPrice, BallShopPrice, EconomySettings, PassiveIncomePool
+from . import monkeypatch
+from .helpers import compute_quicksell_price_for, disabled_embed, error_embed, fmt, get_cfg, get_player
+from .tasks import EconomyTasksMixin, run_passive_tick
+from .views import BulkQuicksellView
 
 if TYPE_CHECKING:
     from ballsdex.core.bot import BallsDexBot
@@ -32,226 +26,8 @@ log = logging.getLogger(__name__)
 
 BallInstanceTransform = app_commands.Transform[BallInstance, BallInstanceTransformer]
 
-# ── Monkeypatch ───────────────────────────────────────────────────────────────
 
-_original_catch_ball = BallSpawnView.catch_ball
-
-
-async def _patched_catch_ball(
-    self: BallSpawnView,
-    user: discord.User | discord.Member,
-    *,
-    player: Player | None,
-    guild: discord.Guild | None,
-):
-    ball, is_new = await _original_catch_ball(self, user, player=player, guild=guild)
-
-    if not settings.currency_enabled:
-        return ball, is_new
-
-    try:
-        cfg = await EconomySettings.objects.afirst()
-    except Exception:
-        return ball, is_new
-
-    if cfg is None or not cfg.catch_income_enabled:
-        return ball, is_new
-
-    if player is None:
-        try:
-            player = await Player.objects.aget(discord_id=user.id)
-        except Player.DoesNotExist:
-            return ball, is_new
-
-    earned = random.randint(cfg.catch_base_min, cfg.catch_base_max)
-    earned += int(ball.ball.rarity * cfg.catch_rarity_multiplier)
-    if ball.special_id is not None:
-        earned += cfg.catch_special_bonus
-
-    await player.add_money(earned)
-    log.debug("Catch income: player %s earned %d (%s)", user.id, earned, ball.ball.country)
-    return ball, is_new
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def fmt(amount: int, bot: "BallsDexBot | None" = None) -> str:
-    """Format currency using bot emoji if available, falling back to symbol."""
-    return format_currency(amount, shortened=True, bot=bot)
-
-
-def error_embed(title: str, desc: str) -> discord.Embed:
-    return discord.Embed(title=title, description=desc, color=discord.Color.red())
-
-
-def disabled_embed(reason: str) -> discord.Embed:
-    return discord.Embed(title="Command Disabled", description=reason, color=discord.Color.red())
-
-
-# ── Bulk quicksell view ───────────────────────────────────────────────────────
-
-class BulkQuicksellView(discord.ui.View):
-    """Paginated select for selling multiple balls at once."""
-
-    def __init__(
-        self,
-        interaction: discord.Interaction["BallsDexBot"],
-        balls: list[BallInstance],
-        cfg: EconomySettings,
-        price_cache: dict[int, tuple[int, int]],
-    ):
-        super().__init__(timeout=120)
-        self.interaction = interaction
-        self.all_balls = balls
-        self.cfg = cfg
-        self.price_cache = price_cache
-        self.page = 0
-        self.per_page = 25
-        self.selected_pks: set[int] = set()
-        self._build_select()
-
-    def _build_select(self) -> None:
-        # Remove old select if exists
-        for child in list(self.children):
-            if isinstance(child, discord.ui.Select):
-                self.remove_item(child)
-
-        start = self.page * self.per_page
-        page_balls = self.all_balls[start : start + self.per_page]
-
-        options = []
-        for bi in page_balls:
-            ball_min, ball_max = self.price_cache.get(bi.ball_id, (self.cfg.quicksell_default_min, self.cfg.quicksell_default_max))
-            est_min = ball_min
-            est_max = ball_max
-            if bi.special_id:
-                est_min = int(est_min * self.cfg.quicksell_special_multiplier)
-                est_max = int(est_max * self.cfg.quicksell_special_multiplier)
-            special_tag = f" [{bi.special.name}]" if bi.special_id and bi.special else ""
-            label = f"{bi.ball.country}{special_tag}"[:100]
-            desc = f"ATK {bi.attack_bonus:+}% HP {bi.health_bonus:+}% | Est. {est_min}–{est_max}"[:100]
-            options.append(
-                discord.SelectOption(
-                    label=label,
-                    value=str(bi.pk),
-                    description=desc,
-                    default=bi.pk in self.selected_pks,
-                )
-            )
-
-        select = discord.ui.Select(
-            placeholder=f"Select balls to sell (page {self.page + 1}/{self._max_pages()})",
-            options=options,
-            min_values=0,
-            max_values=len(options),
-        )
-        select.callback = self._on_select
-        self.add_item(select)
-
-    def _max_pages(self) -> int:
-        return max(1, (len(self.all_balls) + self.per_page - 1) // self.per_page)
-
-    async def _on_select(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer()
-        # Update selection
-        start = self.page * self.per_page
-        page_balls = self.all_balls[start : start + self.per_page]
-        page_pks = {bi.pk for bi in page_balls}
-        # Remove deselected from this page
-        self.selected_pks -= page_pks
-        # Add newly selected
-        for v in interaction.data.get("values", []):
-            self.selected_pks.add(int(v))
-        self._build_select()
-        await interaction.edit_original_response(
-            embed=self._build_embed(), view=self
-        )
-
-    def _build_embed(self) -> discord.Embed:
-        embed = discord.Embed(
-            title="Bulk Quick Sell",
-            description=(
-                f"Select balls to sell across pages, then click **Confirm**.\n"
-                f"**{len(self.selected_pks)}** ball(s) selected."
-            ),
-            color=discord.Color.blurple(),
-        )
-        embed.set_footer(text=f"Page {self.page + 1}/{self._max_pages()} • {len(self.all_balls)} eligible balls")
-        return embed
-
-    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, row=1)
-    async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer()
-        if self.page > 0:
-            self.page -= 1
-            self._build_select()
-        await interaction.edit_original_response(embed=self._build_embed(), view=self)
-
-    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, row=1)
-    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer()
-        if self.page < self._max_pages() - 1:
-            self.page += 1
-            self._build_select()
-        await interaction.edit_original_response(embed=self._build_embed(), view=self)
-
-    @discord.ui.button(label="Confirm Sell", style=discord.ButtonStyle.danger, row=1)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer()
-        if not self.selected_pks:
-            await interaction.followup.send("No balls selected.", ephemeral=True)
-            return
-
-        self.stop()
-        # Process the sell
-        total_price = 0
-        count = 0
-        for bi in self.all_balls:
-            if bi.pk not in self.selected_pks:
-                continue
-            ball_min, ball_max = self.price_cache.get(bi.ball_id, (self.cfg.quicksell_default_min, self.cfg.quicksell_default_max))
-            price = random.randint(ball_min, ball_max)
-            if bi.special_id:
-                # Check per-special multiplier
-                try:
-                    sbonus = await SpecialEconomyBonus.objects.aget(special_id=bi.special_id)
-                    if sbonus.quicksell_multiplier_enabled:
-                        price = int(price * sbonus.quicksell_multiplier)
-                    else:
-                        price = int(price * self.cfg.quicksell_special_multiplier)
-                except SpecialEconomyBonus.DoesNotExist:
-                    price = int(price * self.cfg.quicksell_special_multiplier)
-            if bi.attack_bonus > 0 and bi.health_bonus > 0:
-                price += self.cfg.quicksell_high_roll_bonus
-            price = max(1, price)
-            total_price += price
-            count += 1
-            bi.deleted = True
-            await bi.asave(update_fields=["deleted"])
-
-        player = await Player.objects.aget(discord_id=interaction.user.id)
-        await player.add_money(total_price)
-        await player.arefresh_from_db(fields=["money"])
-
-        embed = discord.Embed(title="Bulk Sell Complete", color=discord.Color.green())
-        embed.add_field(name="Balls Sold", value=str(count), inline=True)
-        embed.add_field(name="Total Received", value=fmt(total_price, interaction.client), inline=True)
-        embed.add_field(name="New Balance", value=fmt(player.money, interaction.client), inline=True)
-        await interaction.edit_original_response(embed=embed, view=None)
-
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, row=1)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer()
-        self.stop()
-        await interaction.edit_original_response(
-            embed=discord.Embed(title="Cancelled", color=discord.Color.orange()),
-            view=None,
-        )
-
-
-# ── Cog ───────────────────────────────────────────────────────────────────────
-
-class Economy(commands.GroupCog, group_name="economy"):
+class Economy(EconomyTasksMixin, commands.GroupCog, group_name="economy"):
     """Economy — earn currency, sell balls and manage your balance."""
 
     admin = app_commands.Group(name="admin", description="Economy management tools for staff.")
@@ -261,8 +37,7 @@ class Economy(commands.GroupCog, group_name="economy"):
         super().__init__()
 
     async def cog_load(self) -> None:
-        BallSpawnView.catch_ball = _patched_catch_ball  # type: ignore[method-assign]
-        log.info("Economy: monkeypatch applied.")
+        monkeypatch.apply_patch()
         self.bot.loop.create_task(self._post_init())
 
     async def _post_init(self) -> None:
@@ -283,7 +58,7 @@ class Economy(commands.GroupCog, group_name="economy"):
         self.expire_listings_task.start()
 
     def cog_unload(self) -> None:
-        BallSpawnView.catch_ball = _original_catch_ball  # type: ignore[method-assign]
+        monkeypatch.restore_patch()
         self.passive_income_task.cancel()
         self.expire_listings_task.cancel()
 
@@ -306,67 +81,8 @@ class Economy(commands.GroupCog, group_name="economy"):
             return False
         return True
 
-    async def _get_player(self, interaction: discord.Interaction) -> Player | None:
-        try:
-            return await Player.objects.aget(discord_id=interaction.user.id)
-        except Player.DoesNotExist:
-            send = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
-            await send(
-                embed=error_embed("No Account", f"You don't have a player profile yet. Catch some {settings.plural_collectible_name} first!"),
-                ephemeral=True,
-            )
-            return None
-
-    async def _get_cfg(self) -> EconomySettings | None:
-        try:
-            return await EconomySettings.objects.afirst()
-        except Exception:
-            return None
-
     def _fmt(self, amount: int) -> str:
         return fmt(amount, self.bot)
-
-    # ── Background tasks ──────────────────────────────────────────────────────
-
-    @tasks.loop(minutes=10)
-    async def passive_income_task(self) -> None:
-        if not settings.currency_enabled:
-            return
-        cfg = await self._get_cfg()
-        if cfg is None or not cfg.passive_enabled:
-            return
-
-        now = timezone.now()
-        async for player in Player.objects.all():
-            total = 0
-            async for bi in BallInstance.objects.filter(player=player, deleted=False).select_related("ball", "special"):
-                if random.random() < cfg.passive_chance:
-                    base = random.randint(cfg.passive_min, cfg.passive_max)
-                    tick = max(1, base + int(bi.ball.rarity * cfg.passive_rarity_bonus))
-                    # Apply per-special passive multiplier if set
-                    if bi.special_id:
-                        try:
-                            sbonus = await SpecialEconomyBonus.objects.aget(special_id=bi.special_id)
-                            if sbonus.passive_multiplier_enabled:
-                                tick = int(tick * sbonus.passive_multiplier)
-                        except SpecialEconomyBonus.DoesNotExist:
-                            pass
-                    total += tick
-            if total > 0:
-                pool, _ = await PassiveIncomePool.objects.aget_or_create(
-                    player=player, defaults={"pending": 0, "total_earned": 0}
-                )
-                pool.pending += total
-                pool.total_earned += total
-                pool.last_tick = now
-                await pool.asave(update_fields=["pending", "total_earned", "last_tick"])
-
-    @tasks.loop(minutes=15)
-    async def expire_listings_task(self) -> None:
-        now = timezone.now()
-        async for listing in BallListing.objects.filter(sold=False, expires_at__lte=now):
-            await listing.adelete()
-            log.info("Listing #%d expired.", listing.pk)
 
     # ── /economy quicksell ────────────────────────────────────────────────────
 
@@ -376,12 +92,12 @@ class Economy(commands.GroupCog, group_name="economy"):
         """Sell a ball instantly to the system. Price is set per-ball in the admin panel."""
         if not await self._guard_currency(interaction):
             return
-        cfg = await self._get_cfg()
+        cfg = await get_cfg()
         if cfg is None or not cfg.quicksell_enabled:
             await interaction.response.send_message(embed=disabled_embed("Quicksell is currently disabled."), ephemeral=True)
             return
 
-        player = await self._get_player(interaction)
+        player = await get_player(interaction)
         if player is None:
             return
 
@@ -397,27 +113,7 @@ class Economy(commands.GroupCog, group_name="economy"):
 
         # Fetch with full relations
         ball = await BallInstance.objects.select_related("ball", "special").aget(pk=ball.pk)
-
-        try:
-            price_cfg = await BallSellPrice.objects.aget(ball=ball.ball)
-            ball_min, ball_max = price_cfg.min_price, price_cfg.max_price
-        except BallSellPrice.DoesNotExist:
-            ball_min, ball_max = cfg.quicksell_default_min, cfg.quicksell_default_max
-
-        price = random.randint(ball_min, ball_max)
-        if ball.special_id is not None:
-            # Check per-special multiplier
-            try:
-                sbonus = await SpecialEconomyBonus.objects.aget(special_id=ball.special_id)
-                if sbonus.quicksell_multiplier_enabled:
-                    price = int(price * sbonus.quicksell_multiplier)
-                else:
-                    price = int(price * cfg.quicksell_special_multiplier)
-            except SpecialEconomyBonus.DoesNotExist:
-                price = int(price * cfg.quicksell_special_multiplier)
-        if ball.attack_bonus > 0 and ball.health_bonus > 0:
-            price += cfg.quicksell_high_roll_bonus
-        price = max(1, price)
+        price = await compute_quicksell_price_for(ball, cfg)
 
         ball_emoji = self.bot.get_emoji(ball.ball.emoji_id) or ""
         special_name = ball.special.name if ball.special_id and ball.special else None
@@ -442,12 +138,12 @@ class Economy(commands.GroupCog, group_name="economy"):
         """Select multiple balls to quick sell at once."""
         if not await self._guard_currency(interaction):
             return
-        cfg = await self._get_cfg()
+        cfg = await get_cfg()
         if cfg is None or not cfg.quicksell_enabled:
             await interaction.response.send_message(embed=disabled_embed("Quicksell is currently disabled."), ephemeral=True)
             return
 
-        player = await self._get_player(interaction)
+        player = await get_player(interaction)
         if player is None:
             return
 
@@ -484,7 +180,7 @@ class Economy(commands.GroupCog, group_name="economy"):
         """List a ball on the player market at a price you set."""
         if not await self._guard_currency(interaction):
             return
-        cfg = await self._get_cfg()
+        cfg = await get_cfg()
         if cfg is None or not cfg.listings_enabled:
             await interaction.response.send_message(embed=disabled_embed("The player market is currently disabled."), ephemeral=True)
             return
@@ -492,7 +188,7 @@ class Economy(commands.GroupCog, group_name="economy"):
             await interaction.response.send_message(embed=error_embed("Price Too Low", f"Minimum listing price is {self._fmt(cfg.listing_min_price)}."), ephemeral=True)
             return
 
-        player = await self._get_player(interaction)
+        player = await get_player(interaction)
         if player is None:
             return
 
@@ -539,7 +235,7 @@ class Economy(commands.GroupCog, group_name="economy"):
         """Browse all active ball listings on the player market."""
         if not await self._guard_currency(interaction):
             return
-        cfg = await self._get_cfg()
+        cfg = await get_cfg()
         if cfg and not cfg.listings_enabled:
             await interaction.response.send_message(embed=disabled_embed("The player market is currently disabled."), ephemeral=True)
             return
@@ -549,9 +245,7 @@ class Economy(commands.GroupCog, group_name="economy"):
         offset = (max(1, page) - 1) * per_page
 
         # Filter out deleted and traded-away balls
-        total = await BallListing.objects.filter(
-            sold=False, ball_instance__deleted=False
-        ).acount()
+        total = await BallListing.objects.filter(sold=False, ball_instance__deleted=False).acount()
 
         if total == 0:
             await interaction.followup.send(embed=discord.Embed(title=f"{settings.plural_collectible_name.title()} Market", description=f"No active listings right now.\nUse `/economy list` to sell your {settings.plural_collectible_name}!", color=discord.Color.blurple()), ephemeral=True)
@@ -590,7 +284,7 @@ class Economy(commands.GroupCog, group_name="economy"):
         """Purchase a ball from another player's listing."""
         if not await self._guard_currency(interaction):
             return
-        cfg = await self._get_cfg()
+        cfg = await get_cfg()
         if cfg and not cfg.listings_enabled:
             await interaction.response.send_message(embed=disabled_embed("The player market is currently disabled."), ephemeral=True)
             return
@@ -610,7 +304,7 @@ class Economy(commands.GroupCog, group_name="economy"):
             await interaction.followup.send(embed=error_embed("Listing Unavailable", "That ball is no longer available — the listing has been removed."), ephemeral=True)
             return
 
-        buyer = await self._get_player(interaction)
+        buyer = await get_player(interaction)
         if buyer is None:
             return
         if listing.seller_id == buyer.pk:
@@ -661,7 +355,7 @@ class Economy(commands.GroupCog, group_name="economy"):
         """Remove one of your active listings. The ball stays in your collection."""
         if not await self._guard_currency(interaction):
             return
-        player = await self._get_player(interaction)
+        player = await get_player(interaction)
         if player is None:
             return
         try:
@@ -686,11 +380,11 @@ class Economy(commands.GroupCog, group_name="economy"):
         """View all of your active listings on the market."""
         if not await self._guard_currency(interaction):
             return
-        player = await self._get_player(interaction)
+        player = await get_player(interaction)
         if player is None:
             return
 
-        cfg = await self._get_cfg()
+        cfg = await get_cfg()
         active = [obj async for obj in BallListing.objects.filter(
             seller=player, sold=False, ball_instance__deleted=False
         ).select_related("ball_instance__ball", "ball_instance__special").order_by("price")]
@@ -771,7 +465,7 @@ class Economy(commands.GroupCog, group_name="economy"):
             quantity = min(quantity, item.stock)
 
         total_price = item.price * quantity
-        player = await self._get_player(interaction)
+        player = await get_player(interaction)
         if player is None:
             return
 
@@ -810,11 +504,11 @@ class Economy(commands.GroupCog, group_name="economy"):
         """Check how much passive income is waiting to be claimed."""
         if not await self._guard_currency(interaction):
             return
-        cfg = await self._get_cfg()
+        cfg = await get_cfg()
         if cfg and not await self._guard_command(interaction, cfg.pending_enabled, "/economy pending"):
             return
 
-        player = await self._get_player(interaction)
+        player = await get_player(interaction)
         if player is None:
             return
 
@@ -845,11 +539,11 @@ class Economy(commands.GroupCog, group_name="economy"):
         """Collect all accumulated passive income into your balance."""
         if not await self._guard_currency(interaction):
             return
-        cfg = await self._get_cfg()
+        cfg = await get_cfg()
         if cfg and not await self._guard_command(interaction, cfg.claim_enabled, "/economy claim"):
             return
 
-        player = await self._get_player(interaction)
+        player = await get_player(interaction)
         if player is None:
             return
 
@@ -1073,36 +767,12 @@ class Economy(commands.GroupCog, group_name="economy"):
     async def admin_forcepassive(self, interaction: discord.Interaction["BallsDexBot"]) -> None:
         """Manually trigger a passive income tick for all players right now."""
         await interaction.response.defer(ephemeral=True)
-        cfg = await self._get_cfg()
+        cfg = await get_cfg()
         if cfg is None or not cfg.passive_enabled:
             await interaction.followup.send(embed=error_embed("Disabled", "Passive income is not configured or is disabled."), ephemeral=True)
             return
 
-        now = timezone.now()
-        players_updated = 0
-        total_generated = 0
-        async for player in Player.objects.all():
-            total = 0
-            async for bi in BallInstance.objects.filter(player=player, deleted=False).select_related("ball", "special"):
-                if random.random() < cfg.passive_chance:
-                    base = random.randint(cfg.passive_min, cfg.passive_max)
-                    tick = max(1, base + int(bi.ball.rarity * cfg.passive_rarity_bonus))
-                    if bi.special_id:
-                        try:
-                            sbonus = await SpecialEconomyBonus.objects.aget(special_id=bi.special_id)
-                            if sbonus.passive_multiplier_enabled:
-                                tick = int(tick * sbonus.passive_multiplier)
-                        except SpecialEconomyBonus.DoesNotExist:
-                            pass
-                    total += tick
-            if total > 0:
-                pool, _ = await PassiveIncomePool.objects.aget_or_create(player=player, defaults={"pending": 0, "total_earned": 0})
-                pool.pending += total
-                pool.total_earned += total
-                pool.last_tick = now
-                await pool.asave(update_fields=["pending", "total_earned", "last_tick"])
-                players_updated += 1
-                total_generated += total
+        players_updated, total_generated = await run_passive_tick(cfg)
 
         await interaction.followup.send(embed=discord.Embed(title="Passive Tick Complete", description=f"Generated {self._fmt(total_generated)} across **{players_updated}** players.", color=discord.Color.green()), ephemeral=True)
         log.info("%s triggered manual passive tick: %d for %d players", interaction.user, total_generated, players_updated, extra={"webhook": True})
