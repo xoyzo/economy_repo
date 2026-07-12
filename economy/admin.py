@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import BallListing, BallSellPrice, BallShopPrice, EconomySettings, PassiveIncomePool
+from .models import BallListing, BallSellPrice, BallShopPrice, EconomySettings, PassiveIncomePool, SpecialEconomyBonus
 
 
 @admin.register(EconomySettings)
@@ -118,3 +118,17 @@ class BallShopPriceAdmin(admin.ModelAdmin):
     list_filter = ("enabled",)
     search_fields = ("ball__country",)
     autocomplete_fields = ("ball", "special")
+
+
+@admin.register(SpecialEconomyBonus)
+class SpecialEconomyBonusAdmin(admin.ModelAdmin):
+    list_display = (
+        "special",
+        "quicksell_multiplier_enabled",
+        "quicksell_multiplier",
+        "passive_multiplier_enabled",
+        "passive_multiplier",
+    )
+    list_filter = ("quicksell_multiplier_enabled", "passive_multiplier_enabled")
+    search_fields = ("special__name",)
+    autocomplete_fields = ("special",)
