@@ -313,3 +313,52 @@ class BallShopPrice(models.Model):
 
     def __str__(self) -> str:
         return f"{self.ball.country} — {self.price}"
+
+
+class SpecialEconomyBonus(models.Model):
+    """
+    Per-special override for economy multipliers.
+
+    When enabled, replaces the corresponding global EconomySettings multiplier
+    for balls carrying this special (quicksell_special_multiplier or the
+    implicit passive special bonus). Looked up by special_id via aget(), so
+    this is intentionally a one-to-one relationship — at most one bonus
+    config per special, enforced at the DB level.
+    """
+
+    special = models.OneToOneField(
+        "bd_models.Special",
+        on_delete=models.CASCADE,
+        related_name="economy_bonus",
+    )
+
+    quicksell_multiplier_enabled = models.BooleanField(
+        default=False,
+    )
+    quicksell_multiplier = models.FloatField(
+        default=2.0,
+    )
+
+    passive_multiplier_enabled = models.BooleanField(
+        default=False,
+    )
+    passive_multiplier = models.FloatField(
+        default=2.0,
+    )
+
+    objects: Manager[Self] = Manager()
+
+    class Meta:
+        managed = True
+        db_table = "economy_special_bonus"
+        verbose_name = "Special Economy Bonus"
+        verbose_name_plural = "Special Economy Bonuses"
+
+    def __str__(self) -> str:
+        return f"{self.special.name} economy bonus"
+
+    def clean(self) -> None:
+        if self.quicksell_multiplier < 1.0:
+            raise ValidationError("quicksell_multiplier must be at least 1.0")
+        if self.passive_multiplier < 1.0:
+            raise ValidationError("passive_multiplier must be at least 1.0")
